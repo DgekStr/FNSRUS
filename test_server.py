@@ -377,3 +377,11 @@ class APITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+class IdentifierValidationTests(unittest.TestCase):
+    def test_validate_identifier_rejects_empty_and_unicode_digits(self):
+        for identifier in ("", "１２３４５６７８９０", "١٢٣٤٥٦٧٨٩٠"):
+            with self.subTest(identifier=identifier):
+                with self.assertRaises(api_fns.ProviderError) as error:
+                    api_fns.validate_identifier(identifier)
+                self.assertEqual(error.exception.status, 400)
+                self.assertEqual(error.exception.code, "invalid_input")
