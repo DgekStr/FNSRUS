@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
-  <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/static/style.css?v=3">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
+  <link rel="stylesheet" href="/static/style.css?v=4">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=4"></script>
+  <script type="module" src="/static/app.js?v=5"></script>
 </head>
 <body>
   <header class="site-header">
@@ -43,10 +43,10 @@
         <div><span class="overline">Карточка контрагента</span><h2 id="company-name"></h2></div>
         <button id="copy-all" class="button button-secondary" type="button"><i data-lucide="copy" aria-hidden="true"></i><span>Копировать всё</span></button>
       </div>
-      <div id="verdict-summary" class="verdict-band" role="status"></div>
-      <div id="coverage-summary" class="coverage-summary"></div>
       <nav id="section-nav" class="section-nav" aria-label="Разделы карточки"></nav>
       <div id="sections"></div>
+      <div id="verdict-summary" class="verdict-band" role="status"></div>
+      <div id="coverage-summary" class="coverage-summary"></div>
       <details class="raw-data"><summary>Исходные данные</summary><pre id="raw-json"></pre></details>
     </article>
   </main>
@@ -63,7 +63,7 @@
       <div id="settings-message" class="form-message" role="status" aria-live="polite"></div>
     </form>
   </dialog>
-  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением.</p></div></footer>
+  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a></p></div></footer>
   <div id="copy-status" class="copy-status" role="status" aria-live="polite" hidden></div>
 </body>
 </html>
