@@ -116,7 +116,7 @@ install -m 0600 .env.example /etc/mcp-fns.env
 Основные параметры: `HOST`, `PORT`, `LOG_LEVEL`, `UVX_PATH`,
 `MCP_FNS_REGISTRIES_DB`, `FNS_SETTINGS_PATH`. Смена порта требует соответствующего изменения Nginx.
 Сеть доступа к настройкам задаётся `FNS_SETTINGS_LAN_NETWORKS` (по умолчанию
-`192.168.0.0/24,127.0.0.0/8,::1/128`). Изменяйте allowlist только на доверенные
+`192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128`). Изменяйте allowlist только на доверенные
 подсети; внешний доступ к `/api/settings/*` отвечает 403.
 В systemd для `mcp-egrul` закреплены `MCP_EGRUL_DB=/var/lib/mcp-fns/egrul.sqlite`
 и `MCP_EGRUL_DUMPS_DIR=/var/lib/mcp-fns/dumps`.

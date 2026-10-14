@@ -322,7 +322,7 @@ function renderSearchResults(data, query) {
 
 function setBusy(busy, action = "check") {
   checkButton.disabled = busy;
-  const label = busy ? (action === "search" ? "Ищем…" : "Проверяем…") : "Найти / проверить";
+  const label = busy ? (action === "search" ? "Ищем…" : "Проверяем…") : "Найти";
   checkButton.replaceChildren(icon(busy ? "loader-circle" : "search"), element("span", "", label));
   if (busy) checkButton.firstChild.classList.add("loading-icon");
   form.setAttribute("aria-busy", String(busy));

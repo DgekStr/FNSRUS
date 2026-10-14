@@ -26,7 +26,7 @@ class APITests(unittest.TestCase):
         self.addCleanup(settings_path.stop)
         environment = patch.dict(os.environ, {
             "FNS_API_KEY": "",
-            "FNS_SETTINGS_LAN_NETWORKS": "192.168.0.0/24,127.0.0.0/8,::1/128",
+            "FNS_SETTINGS_LAN_NETWORKS": "192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128",
         })
         environment.start()
         self.addCleanup(environment.stop)
@@ -101,6 +101,9 @@ class APITests(unittest.TestCase):
     def test_api_settings_are_restricted_to_lan(self):
         local_response = self.client.get("/api/settings/api-fns")
         self.assertEqual(local_response.status_code, 200)
+
+        gateway_client = TestClient(server.app, client=("10.1.17.6", 12345))
+        self.assertEqual(gateway_client.get("/api/settings/api-fns").status_code, 200)
 
         remote_client = TestClient(server.app, client=("203.0.113.45", 54321))
         requests = (

@@ -40,7 +40,7 @@ logger = logging.getLogger("fnsrus")
 call_lock = asyncio.Lock()
 settings_lock = asyncio.Lock()
 recent_calls = deque()
-DEFAULT_SETTINGS_LAN_NETWORKS = "192.168.0.0/24,127.0.0.0/8,::1/128"
+DEFAULT_SETTINGS_LAN_NETWORKS = "192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128"
 
 
 def is_settings_client_allowed(request):

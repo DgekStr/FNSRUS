@@ -18,7 +18,7 @@ Environment=LOG_LEVEL=INFO
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=MCP_FNS_REGISTRIES_DB=/var/lib/mcp-fns/registries.sqlite
-Environment=FNS_SETTINGS_LAN_NETWORKS=192.168.0.0/24,127.0.0.0/8,::1/128
+Environment=FNS_SETTINGS_LAN_NETWORKS=192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128
 Environment=MCP_EGRUL_DB=/var/lib/mcp-fns/egrul.sqlite
 Environment=MCP_EGRUL_DUMPS_DIR=/var/lib/mcp-fns/dumps
 Environment=FNS_SETTINGS_PATH=/var/lib/mcp-fns/api-fns-settings.json
