@@ -31,6 +31,9 @@ class APITests(unittest.TestCase):
         settings_path = patch.object(api_fns, "SETTINGS_PATH", Path(directory.name) / "settings.json")
         settings_path.start()
         self.addCleanup(settings_path.stop)
+        import_status_path = patch.object(server, "OPENSANCTIONS_STATUS_PATH", Path(directory.name) / "import-status.json")
+        import_status_path.start()
+        self.addCleanup(import_status_path.stop)
         environment = patch.dict(os.environ, {
             "FNS_API_KEY": "",
             "FNS_SETTINGS_LAN_NETWORKS": "192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128",
