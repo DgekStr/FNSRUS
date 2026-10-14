@@ -37,6 +37,7 @@ MAX_SEARCH_RESULTS = 50
 SEARCH_UNAVAILABLE_MESSAGE = "Поиск по названию временно недоступен, введите ИНН"
 SEARCH_DATA_UNAVAILABLE_MESSAGE = "База ЕГРЮЛ не загружена. Импортируйте официальный набор данных ФНС."
 WIREGUARD_CONTROL_SOCKET = Path(os.environ.get("FNS_WG_CONTROL_SOCKET", "/run/fnsrus-wg-control.sock"))
+OPENSANCTIONS_CONTROL_SOCKET = Path(os.environ.get("FNS_OPENSANCTIONS_CONTROL_SOCKET", "/run/fnsrus-import-control.sock"))
 OPENSANCTIONS_DB = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
 OPENSANCTIONS_STATUS_PATH = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
 OPENSANCTIONS_ENTITY_COUNTS = {"20260912190833-iof": 53_107_328}
@@ -98,6 +99,11 @@ class SearchRequest(BaseModel):
 class WireGuardToggleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = Field(strict=True)
+
+
+class OpenSanctionsImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: str = Field(strict=True, min_length=16, max_length=32)
 
 
 class SettingsRequest(BaseModel):
@@ -321,6 +327,33 @@ def read_opensanctions_import_status():
     return status if isinstance(status, dict) else {}
 
 
+def read_opensanctions_database_version():
+    if not OPENSANCTIONS_DB.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(OPENSANCTIONS_DB.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            row = connection.execute("SELECT value FROM metadata WHERE key = 'version'").fetchone()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.DatabaseError, ValueError):
+        return None
+    version = row[0] if row else None
+    return version if isinstance(version, str) and re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version) else None
+
+
+def opensanctions_version_is_newer(current_version, latest_version):
+    if current_version is None:
+        return True
+    current_match = re.fullmatch(r"([0-9]{14})-[a-z0-9]+", current_version)
+    latest_match = re.fullmatch(r"([0-9]{14})-[a-z0-9]+", latest_version)
+    if not current_match or not latest_match:
+        return False
+    return latest_match.group(1) > current_match.group(1) or (
+        latest_match.group(1) == current_match.group(1) and latest_version != current_version
+    )
+
+
 def opensanctions_average_rate(status):
     global opensanctions_progress_run
     if status.get("state") != "running":
@@ -357,6 +390,28 @@ def opensanctions_average_rate(status):
 def get_opensanctions_import_status():
     status = read_opensanctions_import_status()
     state = status.get("state", "not_started")
+    try:
+        control_status = import_control("status")
+    except APIError:
+        control_status = {}
+    control_available = control_status.get("ok") is True
+    unit_active = bool(control_status.get("active"))
+    active_states = {"starting", "checking", "running", "indexing", "validating"}
+    unit_starting = unit_active and state not in active_states | {"ready_to_publish"}
+    if unit_starting:
+        state = "starting"
+        status = {
+            **status,
+            "state": state,
+            "version": control_status.get("expected_version") or status.get("version"),
+            "scanned": 0,
+            "imported": 0,
+            "expected_entities": None,
+            "updated_at": None,
+            "source_updated_at": None,
+            "last_source_change": None,
+            "last_change": None,
+        }
     version = status.get("version")
     try:
         scanned = max(0, int(status.get("scanned", 0)))
@@ -370,10 +425,13 @@ def get_opensanctions_import_status():
     staging = None
     if isinstance(version, str) and re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version):
         staging = OPENSANCTIONS_DB.with_name(f".{OPENSANCTIONS_DB.name}.{version}.tmp")
-    published = state == "complete" and OPENSANCTIONS_DB.is_file()
+    published_version = read_opensanctions_database_version()
+    published = published_version is not None
+    can_start_import = control_available and not unit_active and state not in active_states | {"ready_to_publish"}
     return {
         "state": state,
         "version": version,
+        "published_version": published_version,
         "scanned": scanned,
         "imported": imported,
         "expected_entities": expected or None,
@@ -388,13 +446,22 @@ def get_opensanctions_import_status():
         "error": status.get("error"),
         "published": published,
         "can_publish": state == "ready_to_publish" and staging is not None and staging.is_file(),
+        "can_start_import": can_start_import,
+        "import_control_available": control_available,
+        "unit_active": unit_active,
     }
 
 
-def opensanctions_import_in_progress():
-    return read_opensanctions_import_status().get("state") in {
-        "running", "indexing", "validating", "ready_to_publish",
-    }
+async def opensanctions_import_in_progress():
+    if read_opensanctions_import_status().get("state") in {
+        "starting", "checking", "running", "indexing", "validating", "ready_to_publish",
+    }:
+        return True
+    try:
+        control_status = await asyncio.to_thread(import_control, "status")
+        return bool(control_status.get("active"))
+    except APIError:
+        return False
 
 
 async def call_search_by_name(query):
@@ -429,7 +496,7 @@ async def call_search_by_name(query):
                         "search_import_ready_to_publish",
                         "Импорт завершён; опубликуйте базу в настройках, чтобы включить поиск.",
                     ) from error
-                if opensanctions_import_in_progress():
+                if await opensanctions_import_in_progress():
                     raise APIError(
                         503,
                         "search_import_in_progress",
@@ -460,6 +527,29 @@ def wireguard_control(command):
     except (OSError, ValueError, json.JSONDecodeError) as error:
         logger.error("WireGuard control socket failed (%s)", type(error).__name__)
         raise APIError(503, "wireguard_control_unavailable", "Управление WireGuard временно недоступно.") from error
+
+
+def import_control(command, expected_version=None):
+    if command not in {"status", "start"}:
+        raise ValueError("invalid OpenSanctions control command")
+    payload = {"command": command}
+    if expected_version is not None:
+        payload["expected_version"] = expected_version
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(35 if command == "start" else 15)
+            client.connect(str(OPENSANCTIONS_CONTROL_SOCKET))
+            client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            response = client.makefile("rb").readline(2049)
+        if len(response) > 2048 or not response.endswith(b"\n"):
+            raise ValueError("invalid import control response size")
+        result = json.loads(response)
+        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+            raise ValueError("invalid import control response")
+        return result
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        logger.error("OpenSanctions import control socket failed (%s)", type(error).__name__)
+        raise APIError(503, "import_control_unavailable", "Запуск импорта временно недоступен.") from error
 
 
 app = FastAPI(title="ФНС РУС", version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
@@ -592,7 +682,95 @@ async def update_wireguard_settings(body: WireGuardToggleRequest):
 
 @app.get("/api/settings/opensanctions")
 async def get_opensanctions_settings():
-    return get_opensanctions_import_status()
+    return await asyncio.to_thread(get_opensanctions_import_status)
+
+
+@app.get("/api/settings/opensanctions/update-check")
+async def check_opensanctions_update():
+    status = read_opensanctions_import_status()
+    try:
+        control_status = await asyncio.to_thread(import_control, "status")
+    except APIError as error:
+        raise APIError(503, "import_control_unavailable", "Запуск импорта временно недоступен.") from error
+    current_version = await asyncio.to_thread(read_opensanctions_database_version)
+    if status.get("state") == "ready_to_publish":
+        return {
+            "decision": "publish_required", "current_version": current_version,
+            "latest_version": None, "can_start": False,
+        }
+    if status.get("state") in {"starting", "checking", "running", "indexing", "validating"} or control_status.get("active"):
+        return {
+            "decision": "import_running", "current_version": current_version,
+            "latest_version": None, "can_start": False,
+        }
+    try:
+        latest = await asyncio.to_thread(opensanctions_import.fetch_index)
+    except Exception as error:
+        logger.warning("OpenSanctions version check failed (%s)", type(error).__name__)
+        raise APIError(
+            503,
+            "opensanctions_version_unavailable",
+            "Не удалось проверить версию OpenSanctions. Проверьте подключение WireGuard и повторите попытку.",
+        ) from error
+    latest_version = latest["version"]
+    if current_version is None:
+        decision = "initial_import"
+    elif latest_version == current_version:
+        decision = "up_to_date"
+    elif opensanctions_version_is_newer(current_version, latest_version):
+        decision = "update_available"
+    else:
+        decision = "upstream_older"
+    return {
+        "decision": decision,
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "entity_count": latest["entity_count"],
+        "source_updated_at": latest["updated_at"],
+        "last_source_change": latest["last_change"],
+        "can_start": decision in {"initial_import", "update_available"},
+    }
+
+
+@app.post("/api/settings/opensanctions/import")
+async def start_opensanctions_import(body: OpenSanctionsImportRequest):
+    expected_version = body.expected_version
+    if not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
+        raise APIError(422, "invalid_import_version", "Версия OpenSanctions указана неверно.")
+    status = read_opensanctions_import_status()
+    if status.get("state") == "ready_to_publish":
+        raise APIError(409, "publish_required", "Сначала опубликуйте завершённую staging-базу.")
+    if status.get("state") in {"starting", "checking", "running", "indexing", "validating"}:
+        raise APIError(409, "import_busy", "Импорт уже выполняется.")
+    try:
+        latest = await asyncio.to_thread(opensanctions_import.fetch_index)
+    except Exception as error:
+        logger.warning("OpenSanctions version recheck failed (%s)", type(error).__name__)
+        raise APIError(
+            503,
+            "opensanctions_version_unavailable",
+            "Не удалось перепроверить версию OpenSanctions. Повторите проверку.",
+        ) from error
+    latest_version = latest["version"]
+    if expected_version != latest_version:
+        raise APIError(
+            409,
+            "snapshot_changed",
+            "Снимок OpenSanctions обновился после проверки. Сверьте версии повторно.",
+            {"latest_version": latest_version},
+        )
+    current_version = await asyncio.to_thread(read_opensanctions_database_version)
+    if current_version is not None and not opensanctions_version_is_newer(current_version, latest_version):
+        raise APIError(409, "no_newer_snapshot", "Уже опубликована последняя доступная версия базы.")
+    control_result = await asyncio.to_thread(import_control, "start", latest_version)
+    if not control_result["ok"]:
+        if control_result.get("error") in {"import_busy", "publish_required"}:
+            raise APIError(409, control_result["error"], "Импорт уже запущен или ожидает публикации.")
+        raise APIError(503, "import_start_failed", "Не удалось запустить импорт OpenSanctions.")
+    return JSONResponse(
+        {"state": "starting", "version": latest_version, "entity_count": latest["entity_count"]},
+        status_code=202,
+    )
 
 
 @app.post("/api/settings/opensanctions/publish")

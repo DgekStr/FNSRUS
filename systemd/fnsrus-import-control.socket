@@ -1,0 +1,12 @@
+[Unit]
+Description=FNSRUS OpenSanctions import control socket
+
+[Socket]
+ListenStream=/run/fnsrus-import-control.sock
+SocketUser=deploy
+SocketGroup=www-data
+SocketMode=0600
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

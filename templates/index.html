@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
-  <link rel="stylesheet" href="/static/style.css?v=8">
+  <link rel="stylesheet" href="/static/style.css?v=9">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=12"></script>
+  <script type="module" src="/static/app.js?v=13"></script>
 </head>
 <body>
   <header class="site-header">
@@ -103,6 +103,11 @@
       <p id="opensanctions-progress-label" class="opensanctions-details"></p>
       <p id="opensanctions-estimate" class="opensanctions-details"></p>
       <p id="opensanctions-source" class="opensanctions-details"></p>
+      <div class="opensanctions-actions">
+        <button id="opensanctions-check" class="button button-secondary" type="button" disabled><i data-lucide="refresh-cw" aria-hidden="true"></i><span>Сверить версии</span></button>
+        <button id="opensanctions-start" class="button button-primary" type="button" hidden disabled><i data-lucide="download" aria-hidden="true"></i><span id="opensanctions-start-label">Запустить импорт</span></button>
+      </div>
+      <p id="opensanctions-update-status" class="opensanctions-details" role="status" aria-live="polite"></p>
       <button id="opensanctions-publish" class="button button-primary opensanctions-publish" type="button" hidden><i data-lucide="database" aria-hidden="true"></i><span>Опубликовать базу</span></button>
       <p id="opensanctions-message" class="opensanctions-message" role="status" aria-live="polite"></p>
     </section>

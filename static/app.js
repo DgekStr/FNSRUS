@@ -508,10 +508,17 @@ const opensanctionsEstimate = document.getElementById("opensanctions-estimate");
 const opensanctionsSource = document.getElementById("opensanctions-source");
 const opensanctionsPublish = document.getElementById("opensanctions-publish");
 const opensanctionsMessage = document.getElementById("opensanctions-message");
+const opensanctionsCheck = document.getElementById("opensanctions-check");
+const opensanctionsStart = document.getElementById("opensanctions-start");
+const opensanctionsStartLabel = document.getElementById("opensanctions-start-label");
+const opensanctionsUpdateStatus = document.getElementById("opensanctions-update-status");
 let opensanctionsTimer = null;
 let opensanctionsPollBusy = false;
 let opensanctionsPublishing = false;
+let opensanctionsChecking = false;
+let opensanctionsStarting = false;
 let opensanctionsCurrent = null;
+let opensanctionsUpdate = null;
 
 function showSettings(data) {
   apiSettings = data;
@@ -606,13 +613,13 @@ wireguardToggle.addEventListener("change", async () => {
   }
 });
 
-async function opensanctionsRequest(publish = false) {
-  const response = await fetch(publish ? "/api/settings/opensanctions/publish" : "/api/settings/opensanctions", {
-    method: publish ? "POST" : "GET",
+async function opensanctionsRequest(endpoint = "", method = "GET", body) {
+  const response = await fetch(`/api/settings/opensanctions${endpoint}`, {
+    method,
     headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
-    body: publish ? "{}" : undefined,
+    body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
-    signal: AbortSignal.timeout(publish ? 180000 : 15000),
+    signal: AbortSignal.timeout(endpoint === "/publish" ? 180000 : endpoint === "/import" ? 60000 : endpoint ? 45000 : 15000),
   });
   let data;
   try { data = await response.json(); }
@@ -640,6 +647,8 @@ function renderOpenSanctionsStatus(data) {
   opensanctionsCurrent = data;
   const labels = {
     not_started: "Импорт ещё не запускался.",
+    starting: "Запускается импорт OpenSanctions.",
+    checking: "Сверяется версия снимка OpenSanctions.",
     running: "Импорт выполняется.",
     indexing: "Сканирование завершено; строится поисковый индекс.",
     validating: "Проверяется целостность базы.",
@@ -668,6 +677,8 @@ function renderOpenSanctionsStatus(data) {
     opensanctionsEstimate.textContent = `Средняя скорость ${formatImportCount(Math.round(data.average_rate_per_second))} строк/с · ориентир сканирования: ${completionText} (около ${formatImportDuration(data.eta_seconds)}).`;
   } else if (data.state === "running") {
     opensanctionsEstimate.textContent = "Средняя оценка появится после двух контрольных обновлений прогресса.";
+  } else if (data.state === "checking") {
+    opensanctionsEstimate.textContent = "Проверяем metadata index перед загрузкой.";
   } else if (["indexing", "validating"].includes(data.state)) {
     opensanctionsEstimate.textContent = "Загрузка завершена; выполняются индексация и итоговая проверка.";
   } else {
@@ -682,7 +693,47 @@ function renderOpenSanctionsStatus(data) {
   opensanctionsSource.textContent = sourceDates.join(" · ");
   opensanctionsPublish.hidden = !data.can_publish;
   opensanctionsPublish.disabled = opensanctionsPublishing || !data.can_publish;
+  const importBusy = data.unit_active || ["starting", "checking", "running", "indexing", "validating", "ready_to_publish"].includes(data.state);
+  const importControlUnavailable = data.import_control_available === false;
+  opensanctionsCheck.hidden = importBusy;
+  opensanctionsCheck.disabled = importBusy || importControlUnavailable || opensanctionsChecking;
+  if (importBusy) {
+    opensanctionsUpdate = null;
+    opensanctionsStart.hidden = true;
+    opensanctionsStart.disabled = true;
+    if (["starting", "checking", "running", "indexing", "validating"].includes(data.state)) {
+      opensanctionsUpdateStatus.textContent = "Проверка версии и новый запуск недоступны, пока импорт выполняется.";
+    } else if (data.state === "ready_to_publish") {
+      opensanctionsUpdateStatus.textContent = "Сначала опубликуйте завершённую staging-базу.";
+    }
+  } else if (importControlUnavailable) {
+    opensanctionsStart.hidden = true;
+    opensanctionsStart.disabled = true;
+    opensanctionsUpdate = null;
+    opensanctionsUpdateStatus.textContent = "Сервис ручного запуска импорта недоступен.";
+  } else {
+    opensanctionsStart.hidden = !opensanctionsUpdate?.can_start;
+    opensanctionsStart.disabled = opensanctionsStarting || !opensanctionsUpdate?.can_start;
+    if (opensanctionsUpdate) renderOpenSanctionsUpdate(opensanctionsUpdate);
+  }
   if (data.state === "failed" && data.error) setOpenSanctionsMessage(data.error, true);
+}
+
+function renderOpenSanctionsUpdate(data) {
+  const decisions = {
+    initial_import: `База ещё не опубликована. Доступен снимок ${data.latest_version}.`,
+    update_available: `Доступно обновление ${data.latest_version}; сейчас опубликована ${data.current_version}.`,
+    up_to_date: `Версия ${data.current_version} уже актуальна.`,
+    upstream_older: `В источнике ${data.latest_version}, она старее опубликованной ${data.current_version}; откат не запускается.`,
+    import_running: "Импорт уже выполняется.",
+    publish_required: "Сначала опубликуйте завершённую staging-базу.",
+  };
+  opensanctionsUpdateStatus.textContent = decisions[data.decision] || "Не удалось определить доступность обновления.";
+  opensanctionsCheck.disabled = opensanctionsChecking || opensanctionsCurrent?.can_start_import === false;
+  const canStart = Boolean(data.can_start && opensanctionsCurrent?.can_start_import !== false);
+  opensanctionsStart.hidden = !canStart;
+  opensanctionsStart.disabled = opensanctionsStarting || !canStart;
+  opensanctionsStartLabel.textContent = data.decision === "initial_import" ? "Начать импорт" : "Импортировать обновление";
 }
 
 function setOpenSanctionsMessage(text, isError = false) {
@@ -708,9 +759,68 @@ async function refreshOpenSanctionsStatus() {
   } finally {
     opensanctionsPollBusy = false;
     const state = opensanctionsCurrent?.state;
-    if (!state || ["running", "indexing", "validating"].includes(state)) {
+    if (!state || ["starting", "checking", "running", "indexing", "validating"].includes(state)) {
       scheduleOpenSanctionsRefresh(state ? 15000 : 30000);
     }
+  }
+}
+
+async function checkOpenSanctionsUpdate() {
+  if (opensanctionsChecking || opensanctionsCurrent?.can_start_import === false) return;
+  opensanctionsChecking = true;
+  opensanctionsUpdate = null;
+  opensanctionsCheck.disabled = true;
+  opensanctionsStart.hidden = true;
+  opensanctionsUpdateStatus.textContent = "Сверяем версии снимка…";
+  setOpenSanctionsMessage("");
+  try {
+    opensanctionsUpdate = await opensanctionsRequest("/update-check");
+    renderOpenSanctionsUpdate(opensanctionsUpdate);
+  } catch (error) {
+    opensanctionsUpdateStatus.textContent = "Не удалось проверить версию OpenSanctions.";
+    setOpenSanctionsMessage(error.message, true);
+  } finally {
+    opensanctionsChecking = false;
+    if (opensanctionsCurrent?.can_start_import) opensanctionsCheck.disabled = false;
+  }
+}
+
+async function startOpenSanctionsImport() {
+  const expectedVersion = opensanctionsUpdate?.latest_version;
+  if (opensanctionsStarting || !expectedVersion || !opensanctionsUpdate?.can_start ||
+      opensanctionsCurrent?.can_start_import === false) return;
+  const prompt = opensanctionsUpdate.decision === "initial_import"
+    ? `Запустить импорт снимка ${expectedVersion}?`
+    : `Запустить импорт обновления ${expectedVersion}? Текущая опубликованная база останется доступной до публикации новой.`;
+  if (!confirm(prompt)) return;
+  opensanctionsStarting = true;
+  opensanctionsStart.disabled = true;
+  opensanctionsCheck.disabled = true;
+  setOpenSanctionsMessage("Запускаем импорт…");
+  try {
+    const started = await opensanctionsRequest("/import", "POST", { expected_version: expectedVersion });
+    opensanctionsUpdate = null;
+    renderOpenSanctionsStatus({
+      ...(opensanctionsCurrent || {}),
+      state: "starting",
+      version: started.version,
+      scanned: 0,
+      imported: 0,
+      expected_entities: null,
+      progress_percent: null,
+      can_publish: false,
+      can_start_import: false,
+    });
+    setOpenSanctionsMessage(`Запуск принят: ${started.version}. Импорт нельзя продублировать.`);
+  } catch (error) {
+    const message = error.message;
+    opensanctionsUpdate = null;
+    await refreshOpenSanctionsStatus();
+    setOpenSanctionsMessage(message, true);
+  } finally {
+    opensanctionsStarting = false;
+    opensanctionsStart.disabled = !opensanctionsCurrent?.can_start_import || !opensanctionsUpdate?.can_start;
+    if (opensanctionsCurrent?.state === "starting") scheduleOpenSanctionsRefresh(1000);
   }
 }
 
@@ -775,6 +885,8 @@ document.getElementById("settings-test").addEventListener("click", () => setting
 document.getElementById("settings-delete").addEventListener("click", () => {
   if (confirm("Удалить сохранённый API-ключ?")) settingsAction(() => settingsRequest("DELETE"), "Ключ удалён. Используются открытые источники.");
 });
+opensanctionsCheck.addEventListener("click", () => void checkOpenSanctionsUpdate());
+opensanctionsStart.addEventListener("click", () => void startOpenSanctionsImport());
 opensanctionsPublish.addEventListener("click", async () => {
   if (opensanctionsPublishing || !opensanctionsCurrent?.can_publish) return;
   if (!confirm("Опубликовать проверенную базу OpenSanctions и заменить текущую базу поиска?")) return;
@@ -782,7 +894,7 @@ opensanctionsPublish.addEventListener("click", async () => {
   opensanctionsPublish.disabled = true;
   setOpenSanctionsMessage("Публикуем проверенную базу…");
   try {
-    await opensanctionsRequest(true);
+    await opensanctionsRequest("/publish", "POST", {});
     await refreshOpenSanctionsStatus();
     setOpenSanctionsMessage("База опубликована; поиск доступен.");
   } catch (error) {

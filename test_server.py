@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 import server
 import api_fns
 import scripts.import_opensanctions as opensanctions_import
+import scripts.fnsrus_import_control as fnsrus_import_control
 from scripts.import_opensanctions import company_row, create_database, insert_batch
 from scripts.install_opensanctions_proxy import build_proxy_config
 
@@ -37,6 +38,9 @@ class APITests(unittest.TestCase):
         database_path = patch.object(server, "OPENSANCTIONS_DB", Path(directory.name) / "opensanctions.sqlite")
         database_path.start()
         self.addCleanup(database_path.stop)
+        import_control = patch.object(server, "import_control", return_value={"ok": True, "active": False})
+        import_control.start()
+        self.addCleanup(import_control.stop)
         server.opensanctions_progress_samples.clear()
         server.opensanctions_progress_run = None
         environment = patch.dict(os.environ, {
@@ -237,6 +241,27 @@ class APITests(unittest.TestCase):
                 self.assertFalse(database_path.exists())
                 self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "failed")
 
+    def test_opensanctions_import_rejects_changed_expected_version_before_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "opensanctions.sqlite"
+            status_path = Path(directory) / "import-status.json"
+            index = {
+                "version": "20261014190000-new", "entity_count": 1,
+                "updated_at": "2026-10-14T19:00:00+00:00", "last_change": "2026-10-14T18:00:00+00:00",
+                "resource_url": "https://data.opensanctions.org/artifacts/ru_egrul/20261014190000-new/entities.ftm.json",
+                "resource_size": 0, "resource_checksum": "0" * 40,
+            }
+            with patch.object(opensanctions_import, "DATABASE", database_path), \
+                    patch.object(opensanctions_import, "STATUS_FILE", status_path), \
+                    patch.object(opensanctions_import, "MIN_FREE_BYTES", 0), \
+                    patch.object(opensanctions_import, "fetch_index", return_value=index), \
+                    patch.object(opensanctions_import.subprocess, "Popen") as process:
+                with self.assertRaisesRegex(RuntimeError, "snapshot changed"):
+                    opensanctions_import.import_snapshot("20261014180000-old")
+            self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "failed")
+            process.assert_not_called()
+            self.assertEqual(list(Path(directory).glob(".opensanctions*.tmp")), [])
+
     def test_opensanctions_settings_reports_average_eta(self):
         status_path = server.OPENSANCTIONS_STATUS_PATH
         status = {
@@ -255,6 +280,152 @@ class APITests(unittest.TestCase):
         second = self.client.get("/api/settings/opensanctions").json()
         self.assertEqual(second["average_rate_per_second"], 5.0)
         self.assertEqual(second["eta_seconds"], 120)
+
+    def test_opensanctions_settings_reports_clean_starting_state(self):
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({
+            "state": "complete", "version": "20260912190833-iof", "scanned": 53107328, "imported": 1042,
+        }), encoding="utf-8")
+        with patch.object(server, "import_control", return_value={
+            "ok": True, "active": True, "expected_version": "20261014190000-new",
+        }):
+            response = self.client.get("/api/settings/opensanctions")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "starting")
+        self.assertEqual(response.json()["version"], "20261014190000-new")
+        self.assertEqual(response.json()["scanned"], 0)
+        self.assertEqual(response.json()["imported"], 0)
+        self.assertFalse(response.json()["can_start_import"])
+
+    def test_opensanctions_update_check_compares_published_version(self):
+        current_version = "20260912190833-iof"
+        latest_version = "20261014190000-new"
+        database = sqlite3.connect(server.OPENSANCTIONS_DB)
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata(key, value) VALUES ('version', ?)", (current_version,))
+        database.commit()
+        database.close()
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        latest = {
+            "version": latest_version, "entity_count": 1000,
+            "updated_at": "2026-10-14T19:00:00+00:00", "last_change": "2026-10-14T18:00:00+00:00",
+        }
+        with patch.object(opensanctions_import, "fetch_index", return_value=latest), \
+                patch.object(server, "import_control", return_value={"ok": True, "active": False}, create=True):
+            response = self.client.get("/api/settings/opensanctions/update-check")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["current_version"], current_version)
+        self.assertEqual(response.json()["latest_version"], latest_version)
+        self.assertEqual(response.json()["decision"], "update_available")
+        self.assertTrue(response.json()["can_start"])
+
+    def test_opensanctions_update_check_hides_import_when_version_is_current(self):
+        version = "20261014190000-new"
+        database = sqlite3.connect(server.OPENSANCTIONS_DB)
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata(key, value) VALUES ('version', ?)", (version,))
+        database.commit()
+        database.close()
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        latest = {
+            "version": version, "entity_count": 1000,
+            "updated_at": "2026-10-14T19:00:00+00:00", "last_change": "2026-10-14T18:00:00+00:00",
+        }
+        with patch.object(opensanctions_import, "fetch_index", return_value=latest):
+            response = self.client.get("/api/settings/opensanctions/update-check")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["decision"], "up_to_date")
+        self.assertFalse(response.json()["can_start"])
+
+    def test_opensanctions_update_check_blocks_running_import_unit(self):
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        with patch.object(server, "import_control", return_value={"ok": True, "active": True}), \
+                patch.object(opensanctions_import, "fetch_index") as fetch_index:
+            response = self.client.get("/api/settings/opensanctions/update-check")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["decision"], "import_running")
+        self.assertFalse(response.json()["can_start"])
+        fetch_index.assert_not_called()
+
+    def test_opensanctions_import_start_rejects_stale_checked_version(self):
+        latest = {
+            "version": "20261014190000-new", "entity_count": 1000,
+            "updated_at": "2026-10-14T19:00:00+00:00", "last_change": "2026-10-14T18:00:00+00:00",
+        }
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        headers = {"x-fns-settings": "1", "content-type": "application/json"}
+        with patch.object(opensanctions_import, "fetch_index", return_value=latest), \
+                patch.object(server, "import_control", return_value={"ok": True, "active": False}) as control:
+            response = self.client.post(
+                "/api/settings/opensanctions/import", headers=headers,
+                json={"expected_version": "20261014180000-old"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "snapshot_changed")
+        self.assertEqual(response.json()["details"]["latest_version"], latest["version"])
+        control.assert_not_called()
+
+    def test_opensanctions_import_start_refuses_active_status(self):
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "running"}), encoding="utf-8")
+        headers = {"x-fns-settings": "1", "content-type": "application/json"}
+        with patch.object(opensanctions_import, "fetch_index") as fetch_index:
+            response = self.client.post(
+                "/api/settings/opensanctions/import", headers=headers,
+                json={"expected_version": "20261014190000-new"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "import_busy")
+        fetch_index.assert_not_called()
+
+    def test_opensanctions_import_start_launches_checked_version(self):
+        latest = {
+            "version": "20261014190000-new", "entity_count": 1000,
+            "updated_at": "2026-10-14T19:00:00+00:00", "last_change": "2026-10-14T18:00:00+00:00",
+        }
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        headers = {"x-fns-settings": "1", "content-type": "application/json"}
+        with patch.object(opensanctions_import, "fetch_index", return_value=latest), \
+                patch.object(server, "import_control", return_value={
+                    "ok": True, "active": True, "unit": "fnsrus-opensanctions-import@20261014190000-new.service",
+                }) as control:
+            response = self.client.post(
+                "/api/settings/opensanctions/import", headers=headers,
+                json={"expected_version": latest["version"]},
+            )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["state"], "starting")
+        self.assertEqual(control.call_args.args, ("start", latest["version"]))
+
+    def test_import_control_refuses_second_start_when_busy(self):
+        version = "20261014190000-new"
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(fnsrus_import_control, "CONTROL_LOCK", Path(directory) / "control.lock"), \
+                patch.object(fnsrus_import_control, "read_import_status", return_value={"state": "running"}), \
+                patch.object(fnsrus_import_control, "active_units", return_value=[]), \
+                patch.object(fnsrus_import_control, "systemctl") as systemctl:
+            result = fnsrus_import_control.handle({"command": "start", "expected_version": version})
+        self.assertEqual(result["error"], "import_busy")
+        systemctl.assert_not_called()
+
+    def test_import_control_starts_only_version_scoped_unit(self):
+        version = "20261014190000-new"
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(fnsrus_import_control, "CONTROL_LOCK", Path(directory) / "control.lock"), \
+                patch.object(fnsrus_import_control, "read_import_status", return_value={"state": "complete"}), \
+                patch.object(fnsrus_import_control, "active_units", return_value=[]), \
+                patch.object(fnsrus_import_control, "systemctl", return_value=SimpleNamespace(returncode=0)) as systemctl:
+            result = fnsrus_import_control.handle({"command": "start", "expected_version": version})
+        self.assertTrue(result["ok"])
+        systemctl.assert_called_once_with("start", f"fnsrus-opensanctions-import@{version}.service", timeout=30)
+
+    def test_import_control_status_reports_version_scoped_unit(self):
+        version = "20261014190000-new"
+        unit = f"fnsrus-opensanctions-import@{version}.service"
+        with patch.object(fnsrus_import_control, "read_import_status", return_value={"state": "complete"}), \
+                patch.object(fnsrus_import_control, "active_units", return_value=[unit]):
+            result = fnsrus_import_control.status()
+        self.assertTrue(result["active"])
+        self.assertEqual(result["expected_version"], version)
 
     def test_opensanctions_publish_endpoint_validates_and_publishes(self):
         version = "20260912190833-iof"
@@ -377,12 +548,14 @@ class APITests(unittest.TestCase):
         headers = {"x-fns-settings": "1", "content-type": "application/json", "origin": "http://untrusted.example"}
         self.assertEqual(self.client.delete("/api/settings/api-fns", headers=headers).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/opensanctions/publish", headers=headers, json={}).status_code, 403)
+        self.assertEqual(self.client.post("/api/settings/opensanctions/import", headers=headers, json={"expected_version": "20261014190000-new"}).status_code, 403)
         headers.pop("origin")
         response = self.client.post("/api/settings/api-fns", headers=headers, json={"api_key": "short", "enabled": True})
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("short", response.text)
         self.assertEqual(self.client.post("/api/settings/api-fns", headers=headers, json={"enabled": True}).status_code, 422)
         self.assertEqual(self.client.post("/api/settings/opensanctions/publish", json={}).status_code, 403)
+        self.assertEqual(self.client.post("/api/settings/opensanctions/import", json={"expected_version": "20261014190000-new"}).status_code, 403)
 
     def test_api_settings_are_restricted_to_lan(self):
         local_response = self.client.get("/api/settings/api-fns")
@@ -400,6 +573,8 @@ class APITests(unittest.TestCase):
             ("GET", "/api/settings/wireguard", {}),
             ("POST", "/api/settings/wireguard", {"json": {"enabled": True}}),
             ("GET", "/api/settings/opensanctions", {}),
+            ("GET", "/api/settings/opensanctions/update-check", {}),
+            ("POST", "/api/settings/opensanctions/import", {"json": {"expected_version": "20261014190000-new"}}),
             ("POST", "/api/settings/opensanctions/publish", {"json": {}}),
         )
         for method, path, options in requests:

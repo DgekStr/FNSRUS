@@ -114,7 +114,9 @@ svg { width: 20px; height: 20px; flex: none; stroke-width: 1.8; }
 .opensanctions-settings h3 { margin: 0; font-size: 18px; font-weight: 600; }
 .opensanctions-status, .opensanctions-details, .opensanctions-message { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
 .opensanctions-progress { display: block; width: 100%; height: 12px; margin: 14px 0 6px; accent-color: var(--green); }
-.opensanctions-progress[hidden], .opensanctions-publish[hidden] { display: none; }
+.opensanctions-progress[hidden], .opensanctions-actions [hidden], .opensanctions-publish[hidden] { display: none; }
+.opensanctions-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.opensanctions-actions .button { flex: 1 1 130px; font-size: 14px; padding-inline: 10px; }
 .opensanctions-message.error, .opensanctions-status.error { color: var(--red); }
 .opensanctions-publish { margin-top: 14px; }
 .settings-dialog input[type="password"] { width: 100%; }

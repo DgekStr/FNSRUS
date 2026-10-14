@@ -68,11 +68,18 @@ runuser -u deploy -- env \
 `/var/lib/mcp-fns/opensanctions.sqlite`. Исходный 31-ГБ JSON на сервере не
 сохраняется; загрузка идёт через ограниченный WireGuard SOCKS proxy.
 
-Сначала откройте «Настройки API» из LAN и включите WireGuard. Затем запустите:
+Сначала откройте «Настройки API» из LAN и включите WireGuard. В разделе
+OpenSanctions нажмите «Сверить версии». Импорт доступен только если upstream
+snapshot новее опубликованной базы или база ещё не опубликована. Кнопка запуска
+повторно сверяет version перед systemd start; если источник успел обновиться,
+сервер попросит выполнить проверку ещё раз. Пока unit работает или staging ждёт
+публикации, новый запуск заблокирован.
+
+Для ручного запуска из CLI передавайте версию, которую только что проверили:
 
 ```bash
 cd /srv/mcp-fns
-runuser -u deploy -- .venv/bin/python scripts/import_opensanctions.py
+runuser -u deploy -- .venv/bin/python scripts/import_opensanctions.py --expected-version 20260912190833-iof
 ```
 
 Импорт проверяет свободное место, версию/URL metadata index, размер, SHA-1,
@@ -104,7 +111,7 @@ scp -r C:/_project_/FNSRUS/. root@192.168.0.45:/srv/mcp-fns/
 venv, `.env`, SQLite и резервные копии. Пример передачи рабочих каталогов:
 
 ```powershell
-scp -r C:/_project_/FNSRUS/templates C:/_project_/FNSRUS/static C:/_project_/FNSRUS/systemd C:/_project_/FNSRUS/nginx C:/_project_/FNSRUS/docs root@192.168.0.45:/srv/mcp-fns/
+scp -r C:/_project_/FNSRUS/templates C:/_project_/FNSRUS/static C:/_project_/FNSRUS/scripts C:/_project_/FNSRUS/systemd C:/_project_/FNSRUS/nginx C:/_project_/FNSRUS/docs root@192.168.0.45:/srv/mcp-fns/
 scp C:/_project_/FNSRUS/server.py C:/_project_/FNSRUS/api_fns.py C:/_project_/FNSRUS/test_server.py C:/_project_/FNSRUS/VERSION C:/_project_/FNSRUS/requirements.txt C:/_project_/FNSRUS/README.md C:/_project_/FNSRUS/LICENSE C:/_project_/FNSRUS/.env.example root@192.168.0.45:/srv/mcp-fns/
 ```
 
@@ -112,13 +119,13 @@ scp C:/_project_/FNSRUS/server.py C:/_project_/FNSRUS/api_fns.py C:/_project_/FN
 
 ```bash
 cd /srv/mcp-fns
-chown -R deploy:www-data templates static systemd nginx docs
+chown -R deploy:www-data templates static scripts systemd nginx docs
 chown deploy:www-data server.py api_fns.py test_server.py VERSION requirements.txt README.md LICENSE .env.example
-find templates static systemd nginx docs -type d -exec chmod 0750 {} +
-find templates static systemd nginx docs -type f -exec chmod 0640 {} +
+find templates static scripts systemd nginx docs -type d -exec chmod 0750 {} +
+find templates static scripts systemd nginx docs -type f -exec chmod 0640 {} +
 runuser -u deploy -- /home/deploy/.local/bin/uv venv .venv --python /usr/bin/python3
 runuser -u deploy -- /home/deploy/.local/bin/uv pip install --python .venv/bin/python -r requirements.txt
-runuser -u deploy -- .venv/bin/python -m py_compile server.py api_fns.py
+runuser -u deploy -- .venv/bin/python -m py_compile server.py api_fns.py scripts/import_opensanctions.py scripts/fnsrus_import_control.py
 runuser -u deploy -- .venv/bin/python -m unittest test_server -v
 ```
 
@@ -130,11 +137,22 @@ Nginx работает от www-data и читает статику по пра�
 
 ```bash
 cd /srv/mcp-fns
-systemd-analyze verify systemd/mcp-fns-ui.service
+systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
 install -m 0644 systemd/mcp-fns-ui.service /etc/systemd/system/mcp-fns-ui.service
+install -m 0644 systemd/fnsrus-opensanctions-import@.service /etc/systemd/system/fnsrus-opensanctions-import@.service
+install -m 0644 systemd/fnsrus-import-control.socket /etc/systemd/system/fnsrus-import-control.socket
+install -m 0644 systemd/fnsrus-import-control@.service /etc/systemd/system/fnsrus-import-control@.service
+install -D -o root -g root -m 0755 scripts/fnsrus_import_control.py /usr/local/libexec/fnsrus-import-control
 systemctl daemon-reload
+systemctl enable --now fnsrus-import-control.socket
 systemctl enable --now mcp-fns-ui
 ```
+
+`fnsrus-import-control.socket` exposes only fixed `status`/`start` commands to
+the `deploy` user; the helper starts the version-scoped import unit as a
+separate systemd service so UI restarts cannot terminate a long import. The
+import unit is not enabled at boot and runs only after a checked version is
+requested from the LAN settings screen.
 
 Если нужна отдельная конфигурация, скопируйте шаблон:
 

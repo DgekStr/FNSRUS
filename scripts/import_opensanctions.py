@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import os
@@ -77,7 +78,7 @@ def curl_command(url: str) -> list[str]:
 
 def fetch_index() -> dict:
     completed = subprocess.run(
-        curl_command(INDEX_URL), check=True, capture_output=True, timeout=120,
+        curl_command(INDEX_URL), check=True, capture_output=True, timeout=20,
     )
     index = json.loads(completed.stdout)
     version = index.get("version")
@@ -202,11 +203,22 @@ def insert_batch(connection: sqlite3.Connection, rows: list[tuple]) -> int:
     return connection.total_changes - before
 
 
-def _import_snapshot_locked() -> dict:
+def _import_snapshot_locked(expected_version: str | None = None) -> dict:
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
-    if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
-        raise RuntimeError("Меньше 4 ГБ свободно; импорт остановлен до скачивания")
-    index = fetch_index()
+    started_at = datetime.now(UTC).isoformat()
+    write_status(state="checking", version=expected_version, imported=0, scanned=0, started_at=started_at)
+    try:
+        if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
+            raise RuntimeError("Меньше 4 ГБ свободно; импорт остановлен до скачивания")
+        if expected_version is not None and not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
+            raise ValueError("Requested OpenSanctions version is invalid")
+        index = fetch_index()
+        if expected_version is not None and index["version"] != expected_version:
+            raise RuntimeError("OpenSanctions snapshot changed after version check; run the version check again")
+    except Exception as error:
+        write_status(state="failed", version=expected_version, imported=0, scanned=0,
+                     error=f"{type(error).__name__}: {error}")
+        raise
     staging = DATABASE.with_name(f".{DATABASE.name}.{index['version']}.tmp")
     staging.unlink(missing_ok=True)
     connection = create_database(staging)
@@ -222,7 +234,7 @@ def _import_snapshot_locked() -> dict:
     write_status(state="running", version=index["version"], source_updated_at=index["updated_at"],
                  last_source_change=index["last_change"], expected_bytes=index["resource_size"],
                  expected_entities=index["entity_count"], imported=0, scanned=0,
-                 started_at=datetime.now(UTC).isoformat())
+                 started_at=started_at)
     try:
         process = subprocess.Popen(
             curl_command(index["resource_url"]),
@@ -332,9 +344,9 @@ def _import_snapshot_locked() -> dict:
             staging.unlink(missing_ok=True)
 
 
-def import_snapshot() -> dict:
+def import_snapshot(expected_version: str | None = None) -> dict:
     with dataset_lock(DATABASE):
-        return _import_snapshot_locked()
+        return _import_snapshot_locked(expected_version)
 
 
 def publish_snapshot(database: Path = DATABASE, status_file: Path = STATUS_FILE) -> dict:
@@ -385,8 +397,11 @@ def publish_snapshot(database: Path = DATABASE, status_file: Path = STATUS_FILE)
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-version")
+    arguments = parser.parse_args()
     try:
-        result = import_snapshot()
+        result = import_snapshot(arguments.expected_version)
         print(json.dumps(result, ensure_ascii=False))
     except Exception as error:
         print(f"OpenSanctions import failed: {type(error).__name__}: {error}", file=sys.stderr)

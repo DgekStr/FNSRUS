@@ -1,0 +1,26 @@
+[Unit]
+Description=FNSRUS OpenSanctions import (%i)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=deploy
+Group=www-data
+WorkingDirectory=/srv/mcp-fns
+Environment=HOME=/home/deploy
+Environment=FNS_OPENSANCTIONS_DB=/var/lib/mcp-fns/opensanctions.sqlite
+Environment=FNS_OPENSANCTIONS_STATUS=/var/lib/mcp-fns/opensanctions-import-status.json
+ExecStart=/srv/mcp-fns/.venv/bin/python /srv/mcp-fns/scripts/import_opensanctions.py --expected-version %i
+TimeoutStartSec=30
+RuntimeMaxSec=infinity
+TimeoutStopSec=30
+UMask=0027
+MemoryMax=512M
+CPUQuota=80%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/mcp-fns

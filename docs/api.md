@@ -159,7 +159,17 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 - `POST /api/settings/api-fns/test`: проверить сохранённый ключ через `stat`.
 - `DELETE /api/settings/api-fns`: удалить ключ и отключить интеграцию.
 - `GET /api/settings/opensanctions`: LAN-only статус импорта, прогресс, средний темп и ETA.
+- `GET /api/settings/opensanctions/update-check`: сравнить published version с upstream `index.json`.
+- `POST /api/settings/opensanctions/import`: запустить импорт строго указанного `expected_version`.
 - `POST /api/settings/opensanctions/publish`: опубликовать готовую staging-базу. Требует `{}` и `X-FNS-Settings: 1`.
+
+Импорт запускается только после сверки версий. Запрос
+`POST /api/settings/opensanctions/import` принимает
+`{"expected_version":"<версия из update-check>"}`; сервер повторно получает
+upstream index и отклоняет устаревший `expected_version` с HTTP 409. Если новая
+версия уже опубликована, downgrade не разрешается. Активный systemd unit, статус
+импорта и shared file lock блокируют повторный запуск; успешный ответ HTTP 202
+означает, что version-scoped unit принят systemd.
 
 Статус OpenSanctions обновляется контрольными точками импорта. Средняя скорость и
 ETA рассчитываются по нескольким последним обновлениям; до накопления данных ETA
