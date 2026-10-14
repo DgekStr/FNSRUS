@@ -184,7 +184,7 @@ def import_snapshot() -> dict:
             seen += 1
             if len(raw_line) > MAX_LINE_BYTES:
                 invalid += 1
-            else:
+            elif b'"Company"' in raw_line:
                 try:
                     entity = json.loads(raw_line)
                 except (UnicodeDecodeError, ValueError):

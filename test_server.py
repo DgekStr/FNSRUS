@@ -148,6 +148,7 @@ class APITests(unittest.TestCase):
                     patch.object(opensanctions_import, "STATUS_INTERVAL", 1), \
                     patch.object(opensanctions_import, "fetch_index", return_value=index), \
                     patch.object(opensanctions_import.subprocess, "Popen", return_value=FakeProcess()), \
+                    patch.object(opensanctions_import, "company_row", wraps=opensanctions_import.company_row) as convert_company, \
                     patch.object(opensanctions_import, "write_status", wraps=opensanctions_import.write_status) as write_status:
                 result = opensanctions_import.import_snapshot()
 
@@ -163,6 +164,7 @@ class APITests(unittest.TestCase):
 
             self.assertEqual(result["state"], "complete")
             self.assertEqual(result["imported"], 1)
+            convert_company.assert_called_once()
             self.assertEqual(row, ("7707083893", "ПАО Сбербанк", "Москва"))
             self.assertEqual(match_count, 1)
             self.assertEqual(metadata["license"], "CC BY-NC 4.0")
