@@ -342,7 +342,7 @@ def wireguard_control(command):
         raise ValueError("invalid WireGuard control command")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(8)
+            client.settimeout(35)
             client.connect(str(WIREGUARD_CONTROL_SOCKET))
             client.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
             response = client.makefile("rb").readline(4097)

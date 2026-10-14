@@ -537,7 +537,7 @@ async function wireguardRequest(method = "GET", enabled) {
     headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
     body: enabled === undefined ? undefined : JSON.stringify({ enabled }),
     cache: "no-store",
-    signal: AbortSignal.timeout(12000),
+    signal: AbortSignal.timeout(45000),
   });
   let data;
   try { data = await response.json(); }
