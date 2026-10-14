@@ -54,6 +54,10 @@ class APITests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_proxy_config({"outbounds": [{"type": "vless", "tag": "auto-9"}]})
 
+    def test_opensanctions_downloader_requests_compression(self):
+        command = opensanctions_import.curl_command("https://example.invalid/entities.ftm.json")
+        self.assertIn("--compressed", command)
+
     def test_opensanctions_company_row(self):
         entity = {
             "id": "ru-ogrn-1027700132195",

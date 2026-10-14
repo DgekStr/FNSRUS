@@ -30,7 +30,7 @@ LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
 
 def curl_command(url: str) -> list[str]:
     return [
-        "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error",
+        "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error", "--compressed",
         "--proxy", PROXY, url,
     ]
 
