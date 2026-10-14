@@ -1,0 +1,16 @@
+[Unit]
+Description=FNSRUS WireGuard control request
+
+[Service]
+Type=exec
+User=root
+Group=root
+StandardInput=socket
+StandardOutput=socket
+ExecStart=/usr/bin/python3 /usr/local/libexec/fnsrus-wg-control
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/wireguard/fnsrus.conf
+ReadWritePaths=/run

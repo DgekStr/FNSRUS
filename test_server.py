@@ -1,4 +1,7 @@
 import asyncio
+import io
+import json
+import sqlite3
 import os
 import tempfile
 import unittest
@@ -12,6 +15,9 @@ from fastapi.testclient import TestClient
 
 import server
 import api_fns
+import scripts.import_opensanctions as opensanctions_import
+from scripts.import_opensanctions import company_row, create_database, insert_batch
+from scripts.install_opensanctions_proxy import build_proxy_config
 
 
 class APITests(unittest.TestCase):
@@ -35,6 +41,127 @@ class APITests(unittest.TestCase):
     def test_release_version(self):
         self.assertEqual(server.APP_VERSION, "1.2")
         self.assertEqual(server.app.version, server.APP_VERSION)
+
+    def test_scoped_opensanctions_proxy_config(self):
+        outbound = {"type": "hysteria2", "tag": "auto-9", "server": "proxy.invalid", "password": "not-printed"}
+        config, firewall = build_proxy_config({"outbounds": [outbound, {"type": "direct", "tag": "direct"}]})
+        self.assertEqual(config["inbounds"], [{
+            "type": "socks", "tag": "fnsrus-opensanctions-in", "listen": "10.8.0.1", "listen_port": 19450,
+        }])
+        self.assertEqual(config["outbounds"], [outbound])
+        self.assertEqual(config["route"]["final"], "auto-9")
+        self.assertIn('ip saddr != 10.8.0.5 drop', firewall)
+        with self.assertRaises(ValueError):
+            build_proxy_config({"outbounds": [{"type": "vless", "tag": "auto-9"}]})
+
+    def test_opensanctions_company_row(self):
+        entity = {
+            "id": "ru-ogrn-1027700132195",
+            "schema": "Company",
+            "properties": {
+                "innCode": ["7707083893"],
+                "ogrnCode": ["1027700132195"],
+                "name": ["ПОЛНОЕ НАИМЕНОВАНИЕ", "ПАО СБЕРБАНК"],
+                "address": ["г. Москва, ул. Вавилова, д. 19"],
+            },
+        }
+        self.assertEqual(company_row(entity), (
+            "7707083893", "1027700132195", "ПАО СБЕРБАНК", "Москва", "ru-ogrn-1027700132195",
+        ))
+        entity["properties"]["innCode"] = ["123"]
+        self.assertIsNone(company_row(entity))
+
+    def test_opensanctions_database_search(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "opensanctions.sqlite"
+            database = create_database(database_path)
+            insert_batch(database, [(
+                "7707083893", "1027700132195", "ПАО Сбербанк", "Москва", "ru-ogrn-1027700132195",
+            )])
+            database.executescript("""
+                CREATE VIRTUAL TABLE companies_fts USING fts5(
+                    name, content='companies', content_rowid='rowid',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+                INSERT INTO companies_fts(companies_fts) VALUES ('rebuild');
+            """)
+            database.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", [
+                ("source", "OpenSanctions"), ("dataset", "ru_egrul"),
+                ("updated_at", "2026-09-12T19:08:33"), ("last_change", "2026-08-12T19:08:31"),
+                ("license", "CC BY-NC 4.0"),
+            ])
+            database.commit()
+            database.close()
+
+            with patch.object(server, "OPENSANCTIONS_DB", database_path), patch.object(
+                server, "invoke_egrul_search", side_effect=AssertionError("MCP fallback should not run")
+            ):
+                response = self.client.post("/api/search", json={"query": "сбербанк"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"], [{"name": "ПАО Сбербанк", "inn": "7707083893", "city": "Москва"}])
+        self.assertFalse(payload["truncated"])
+        self.assertEqual(payload["source"], "OpenSanctions")
+        self.assertEqual(payload["snapshot_date"], "2026-09-12")
+        self.assertEqual(payload["license"], "CC BY-NC 4.0")
+
+    def test_opensanctions_stream_import_builds_fts_database(self):
+        company = {
+            "id": "ru-ogrn-1027700132195",
+            "schema": "Company",
+            "properties": {
+                "innCode": ["7707083893"], "ogrnCode": ["1027700132195"],
+                "name": ["ПАО Сбербанк"], "address": ["г. Москва, ул. Вавилова"],
+            },
+        }
+        ignored = {"id": "person-1", "schema": "Person", "properties": {"name": ["Не компания"]}}
+        payload = "\n".join(json.dumps(item, ensure_ascii=False) for item in (company, ignored)).encode() + b"\n"
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "opensanctions.sqlite"
+            status_path = Path(directory) / "opensanctions-status.json"
+            index = {
+                "version": "20260912190833-iof", "updated_at": "2026-09-12T19:08:33",
+                "last_change": "2026-08-12T19:08:31", "entity_count": 2,
+                "resource_url": "https://data.opensanctions.org/artifacts/ru_egrul/20260912190833-iof/entities.ftm.json",
+                "resource_size": len(payload),
+            }
+            with patch.object(opensanctions_import, "DATABASE", database_path), \
+                    patch.object(opensanctions_import, "STATUS_FILE", status_path), \
+                    patch.object(opensanctions_import, "MIN_FREE_BYTES", 0), \
+                    patch.object(opensanctions_import, "fetch_index", return_value=index), \
+                    patch.object(opensanctions_import.subprocess, "Popen", return_value=FakeProcess()):
+                result = opensanctions_import.import_snapshot()
+
+            database = sqlite3.connect(database_path)
+            try:
+                row = database.execute("SELECT inn, name, city FROM companies").fetchone()
+                match_count = database.execute(
+                    "SELECT COUNT(*) FROM companies_fts WHERE companies_fts MATCH ?", ('"сбербанк"*',)
+                ).fetchone()[0]
+                metadata = dict(database.execute("SELECT key, value FROM metadata"))
+            finally:
+                database.close()
+
+            self.assertEqual(result["state"], "complete")
+            self.assertEqual(result["imported"], 1)
+            self.assertEqual(row, ("7707083893", "ПАО Сбербанк", "Москва"))
+            self.assertEqual(match_count, 1)
+            self.assertEqual(metadata["license"], "CC BY-NC 4.0")
+            self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "complete")
+            self.assertFalse(list(Path(directory).glob("*.tmp")))
 
     def test_api_settings_roundtrip(self):
         headers = {"x-fns-settings": "1", "content-type": "application/json"}
@@ -111,6 +238,8 @@ class APITests(unittest.TestCase):
             ("POST", "/api/settings/api-fns", {"json": {"enabled": False}}),
             ("POST", "/api/settings/api-fns/test", {}),
             ("DELETE", "/api/settings/api-fns", {}),
+            ("GET", "/api/settings/wireguard", {}),
+            ("POST", "/api/settings/wireguard", {"json": {"enabled": True}}),
         )
         for method, path, options in requests:
             response = remote_client.request(method, path, **options)
@@ -118,6 +247,22 @@ class APITests(unittest.TestCase):
             self.assertEqual(response.json()["error"], "local_network_only")
             self.assertEqual(response.headers["cache-control"], "no-store")
             self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+
+    def test_wireguard_settings_use_control_socket(self):
+        status = {
+            "ok": True, "configured": True, "enabled": False, "active": False,
+            "handshake": False, "endpoint": "192.168.0.39:51820", "proxy": "10.8.0.1:19450",
+        }
+        connected = {**status, "enabled": True, "active": True, "handshake": True}
+        headers = {"x-fns-settings": "1", "content-type": "application/json"}
+        with patch.object(server, "wireguard_control", side_effect=[status, connected]) as control:
+            response = self.client.get("/api/settings/wireguard")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), status)
+            response = self.client.post("/api/settings/wireguard", headers=headers, json={"enabled": True})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), connected)
+        self.assertEqual([item.args[0] for item in control.call_args_list], ["status", "connect"])
 
     def test_invalid_key_replacement_preserves_saved_key(self):
         api_fns.save_settings({"api_key": "original-fake-key", "enabled": True})

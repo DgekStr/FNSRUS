@@ -1,0 +1,23 @@
+[Unit]
+Description=FNSRUS WireGuard route to OpenSanctions proxy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/fnsrus-wg-route up
+ExecStop=/usr/local/libexec/fnsrus-wg-route down
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/wireguard/fnsrus.conf
+ReadWritePaths=/run
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

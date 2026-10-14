@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import re
+import socket
+import sqlite3
 import tempfile
 import time
 from collections import deque
@@ -31,6 +33,8 @@ MAX_CALLS_PER_MINUTE = 10
 MAX_SEARCH_RESULTS = 50
 SEARCH_UNAVAILABLE_MESSAGE = "Поиск по названию временно недоступен, введите ИНН"
 SEARCH_DATA_UNAVAILABLE_MESSAGE = "База ЕГРЮЛ не загружена. Импортируйте официальный набор данных ФНС."
+WIREGUARD_CONTROL_SOCKET = Path(os.environ.get("FNS_WG_CONTROL_SOCKET", "/run/fnsrus-wg-control.sock"))
+OPENSANCTIONS_DB = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
 TOOL_NAMES = frozenset({
     "check_contractor", "check_inn", "check_ogrn", "get_legal_status",
     "get_okveds", "get_directors_history", "check_for_red_flags",
@@ -81,6 +85,11 @@ class CheckRequest(BaseModel):
 class SearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(strict=True, min_length=2, max_length=200)
+
+
+class WireGuardToggleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = Field(strict=True)
 
 
 class SettingsRequest(BaseModel):
@@ -253,12 +262,60 @@ def search_city(hit):
     return address.strip()[:30]
 
 
+def search_opensanctions_database(query):
+    if not OPENSANCTIONS_DB.is_file():
+        return None
+    tokens = [
+        "\"" + cleaned + "\"*"
+        for token in query.replace('"', " ").split()
+        if (cleaned := "".join(character for character in token if character.isalnum() or character == "_"))
+        and len(cleaned) >= 2
+    ]
+    if not tokens:
+        return {"results": [], "truncated": False}
+    database_uri = OPENSANCTIONS_DB.resolve().as_uri() + "?mode=ro"
+    database = sqlite3.connect(database_uri, uri=True, timeout=5)
+    try:
+        database.row_factory = sqlite3.Row
+        rows = database.execute(
+            """
+            SELECT companies.inn, companies.name, companies.city
+            FROM companies_fts
+            JOIN companies ON companies.rowid = companies_fts.rowid
+            WHERE companies_fts MATCH ?
+            ORDER BY bm25(companies_fts)
+            LIMIT ?
+            """,
+            (" AND ".join(tokens), MAX_SEARCH_RESULTS + 1),
+        ).fetchall()
+        metadata = dict(database.execute("SELECT key, value FROM metadata"))
+    finally:
+        database.close()
+    results = [
+        {"name": row["name"], "inn": row["inn"], "city": row["city"] or "—"}
+        for row in rows[:MAX_SEARCH_RESULTS]
+    ]
+    response = {"results": results, "truncated": len(rows) > MAX_SEARCH_RESULTS}
+    if metadata:
+        response["source"] = metadata.get("source", "OpenSanctions")
+        response["dataset"] = metadata.get("dataset", "ru_egrul")
+        response["snapshot_date"] = metadata.get("updated_at", "")[:10]
+        response["last_source_change"] = metadata.get("last_change", "")[:10]
+        response["license"] = metadata.get("license", "CC BY-NC 4.0")
+    return response
+
+
 async def call_search_by_name(query):
     if call_lock.locked():
         raise APIError(409, "busy", "Уже выполняется проверка. Дождитесь её завершения.")
     async with call_lock:
         record_call()
         try:
+            if OPENSANCTIONS_DB.is_file():
+                async with asyncio.timeout(EGRUL_CALL_TIMEOUT):
+                    response = await asyncio.to_thread(search_opensanctions_database, query)
+                if response is not None:
+                    return response
             async with asyncio.timeout(EGRUL_CALL_TIMEOUT):
                 payload = await invoke_egrul_search({"query": query, "limit": MAX_SEARCH_RESULTS})
             hits = payload.get("hits")
@@ -269,7 +326,7 @@ async def call_search_by_name(query):
                 if not isinstance(hit, dict) or not isinstance(hit.get("name"), str) or not isinstance(hit.get("inn"), str):
                     raise APIError(503, "invalid_search_response", SEARCH_UNAVAILABLE_MESSAGE)
                 results.append({"name": hit["name"], "inn": hit["inn"], "city": search_city(hit)})
-            return {"results": results, "truncated": len(hits) >= MAX_SEARCH_RESULTS}
+            return {"results": results, "truncated": len(hits) > MAX_SEARCH_RESULTS}
         except Exception as error:
             api_error = find_api_error(error)
             if api_error is not None and api_error.code == "search_data_unavailable":
@@ -278,6 +335,26 @@ async def call_search_by_name(query):
                 raise api_error from error
             logger.warning("MCP name search failed (%s)", type(error).__name__)
             raise APIError(503, "search_unavailable", SEARCH_UNAVAILABLE_MESSAGE) from error
+
+
+def wireguard_control(command):
+    if command not in {"status", "connect", "disconnect"}:
+        raise ValueError("invalid WireGuard control command")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(8)
+            client.connect(str(WIREGUARD_CONTROL_SOCKET))
+            client.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
+            response = client.makefile("rb").readline(4097)
+        if len(response) > 4096 or not response.endswith(b"\n"):
+            raise ValueError("invalid WireGuard control response size")
+        payload = json.loads(response)
+        if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
+            raise ValueError("invalid WireGuard control response")
+        return payload
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        logger.error("WireGuard control socket failed (%s)", type(error).__name__)
+        raise APIError(503, "wireguard_control_unavailable", "Управление WireGuard временно недоступно.") from error
 
 
 app = FastAPI(title="ФНС РУС", version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
@@ -390,6 +467,22 @@ async def delete_api_settings():
     data = {"api_key": "", "enabled": False, "verified_at": None, "methods": []}
     api_fns.save_settings(data)
     return api_fns.public_settings(data)
+
+
+@app.get("/api/settings/wireguard")
+async def get_wireguard_settings():
+    return await asyncio.to_thread(wireguard_control, "status")
+
+
+@app.post("/api/settings/wireguard")
+async def update_wireguard_settings(body: WireGuardToggleRequest):
+    command = "connect" if body.enabled else "disconnect"
+    result = await asyncio.to_thread(wireguard_control, command)
+    if not result["ok"]:
+        code = result.get("error", "wireguard_control_failed")
+        status = 409 if code == "not_configured" else 503
+        raise APIError(status, code, "Не удалось изменить состояние WireGuard.")
+    return result
 
 
 @app.post("/api/check")

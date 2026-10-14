@@ -1,0 +1,29 @@
+[Unit]
+Description=FNSRUS restricted OpenSanctions egress proxy
+Wants=network-online.target
+After=network-online.target docker.service wg-easy-private-ui.service
+Requires=wg-easy-private-ui.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStartPre=/usr/sbin/ip link show wg0
+ExecStartPre=-/usr/sbin/nft delete table inet fnsrus_opensanctions_proxy
+ExecStartPre=/usr/sbin/nft -f /etc/sing-box-admin/fnsrus-opensanctions/firewall.nft
+ExecStart=/usr/bin/sing-box -D /var/lib/sing-box-fnsrus-opensanctions-proxy -C /etc/sing-box-admin/fnsrus-opensanctions run
+ExecStopPost=-/usr/sbin/nft delete table inet fnsrus_opensanctions_proxy
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=sing-box-fnsrus-opensanctions-proxy
+StateDirectoryMode=0750
+ReadOnlyPaths=/etc/sing-box-admin/fnsrus-opensanctions
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

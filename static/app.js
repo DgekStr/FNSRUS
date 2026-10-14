@@ -300,6 +300,26 @@ function renderSearchResults(data, query) {
   searchEmptyMessage.textContent = results.length ? "" : `По запросу «${query}» ничего не найдено`;
   searchEmptyMessage.classList.toggle("visible", results.length === 0);
   document.getElementById("search-limit-note").hidden = !data.truncated;
+    const attribution = document.getElementById("search-attribution");
+    attribution.replaceChildren();
+    const openSanctions = data.source === "OpenSanctions" || data.dataset === "ru_egrul";
+    attribution.hidden = !openSanctions;
+    if (openSanctions) {
+      const sourceLink = element("a", "", "OpenSanctions ru_egrul");
+      sourceLink.href = "https://www.opensanctions.org/datasets/ru_egrul/";
+      sourceLink.target = "_blank";
+      sourceLink.rel = "noopener noreferrer";
+      const licenseLink = element("a", "", "CC BY-NC 4.0");
+      licenseLink.href = "https://creativecommons.org/licenses/by-nc/4.0/";
+      licenseLink.target = "_blank";
+      licenseLink.rel = "noopener noreferrer";
+      attribution.append("Источник: ", sourceLink, document.createTextNode(". "));
+      const dates = [];
+      if (data.snapshot_date) dates.push(`снимок ${data.snapshot_date}`);
+      if (data.last_source_change) dates.push(`источник изменён ${data.last_source_change}`);
+      if (dates.length) attribution.append(document.createTextNode(`${dates.join("; ")}. `));
+      attribution.append("Лицензия: ", licenseLink, document.createTextNode(". Только для некоммерческого использования."));
+    }
   for (const result of results) {
     const row = element("tr");
     const name = element("td", "search-result-name", result.name || "—");
@@ -469,6 +489,9 @@ document.getElementById("copy-all").addEventListener("click", event => {
 });
 
 const settingsDialog = document.getElementById("api-settings");
+const wireguardToggle = document.getElementById("wireguard-enabled");
+const wireguardStatus = document.getElementById("wireguard-status");
+const wireguardMessage = document.getElementById("wireguard-message");
 const settingsAccessDialog = document.getElementById("settings-access-denied");
 const settingsForm = document.getElementById("settings-form");
 const apiKeyInput = document.getElementById("api-key");
@@ -476,6 +499,8 @@ const apiEnabled = document.getElementById("api-enabled");
 const settingsMessage = document.getElementById("settings-message");
 let apiSettings = { configured: false, enabled: false };
 let settingsBusy = false;
+let wireguardState = { configured: false, enabled: false, active: false, handshake: false };
+let wireguardBusy = false;
 
 function showSettings(data) {
   apiSettings = data;
@@ -505,6 +530,70 @@ async function settingsRequest(method = "GET", body, suffix = "") {
   }
   return data;
 }
+
+async function wireguardRequest(method = "GET", enabled) {
+  const response = await fetch("/api/settings/wireguard", {
+    method,
+    headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
+    body: enabled === undefined ? undefined : JSON.stringify({ enabled }),
+    cache: "no-store",
+    signal: AbortSignal.timeout(12000),
+  });
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error("Сервер вернул некорректный ответ WireGuard."); }
+  if (!response.ok) throw new Error(data.message || "Не удалось изменить состояние WireGuard.");
+  return data;
+}
+
+function showWireguardSettings(data) {
+  wireguardState = data;
+  wireguardToggle.checked = Boolean(data.active);
+  wireguardToggle.disabled = wireguardBusy || !data.configured;
+  if (!data.configured) wireguardStatus.textContent = "Конфигурация WireGuard не установлена.";
+  else if (data.active && data.handshake) wireguardStatus.textContent = `Туннель подключён · proxy ${data.proxy}`;
+  else if (data.active) wireguardStatus.textContent = "Интерфейс включён, ожидается handshake.";
+  else wireguardStatus.textContent = "Туннель выключен.";
+}
+
+async function refreshWireguardSettings() {
+  wireguardBusy = true;
+  wireguardToggle.disabled = true;
+  wireguardMessage.textContent = "Проверяем состояние туннеля…";
+  wireguardMessage.classList.remove("error");
+  try {
+    showWireguardSettings(await wireguardRequest());
+    wireguardMessage.textContent = "";
+  } catch (error) {
+    wireguardMessage.textContent = error.message;
+    wireguardMessage.classList.add("error");
+  } finally {
+    wireguardBusy = false;
+    wireguardToggle.disabled = !wireguardState.configured;
+  }
+}
+
+wireguardToggle.addEventListener("change", async () => {
+  const enabled = wireguardToggle.checked;
+  wireguardBusy = true;
+  wireguardToggle.disabled = true;
+  wireguardMessage.textContent = enabled ? "Подключаем WireGuard…" : "Отключаем WireGuard…";
+  wireguardMessage.classList.remove("error");
+  try {
+    const data = await wireguardRequest("POST", enabled);
+    showWireguardSettings(data);
+    wireguardMessage.textContent = enabled && !data.handshake
+      ? "Интерфейс включён, ожидается handshake."
+      : "Состояние WireGuard обновлено.";
+  } catch (error) {
+    wireguardToggle.checked = Boolean(wireguardState.active);
+    wireguardMessage.textContent = error.message;
+    wireguardMessage.classList.add("error");
+  } finally {
+    wireguardBusy = false;
+    wireguardToggle.disabled = !wireguardState.configured;
+  }
+});
 
 function settingsFeedback(text, isError = false) {
   settingsMessage.textContent = text;
@@ -538,6 +627,7 @@ document.getElementById("settings-open").addEventListener("click", async () => {
   try {
     showSettings(await settingsRequest());
     settingsDialog.showModal();
+    void refreshWireguardSettings();
   } catch (error) {
     if (error.code === "local_network_only") {
       settingsAccessDialog.showModal();
