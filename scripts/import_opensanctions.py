@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -51,6 +52,9 @@ def fetch_index() -> dict:
     )
     if not isinstance(resource, dict) or not isinstance(resource.get("url"), str):
         raise ValueError("OpenSanctions index has no entities.ftm.json resource")
+    checksum = resource.get("checksum")
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{40}", checksum):
+        raise ValueError("OpenSanctions index has no valid SHA-1 checksum for entities.ftm.json")
     resource_url = resource["url"]
     parsed = urlsplit(resource_url)
     if parsed.scheme != "https" or parsed.hostname != "data.opensanctions.org":
@@ -64,6 +68,7 @@ def fetch_index() -> dict:
         "entity_count": int(index.get("entity_count", 0)),
         "resource_url": resource_url,
         "resource_size": int(resource.get("size", 0)),
+        "resource_checksum": checksum,
     }
 
 
@@ -167,6 +172,8 @@ def import_snapshot() -> dict:
     process = None
     imported = 0
     seen = 0
+    stream_bytes = 0
+    stream_hash = hashlib.sha1()
     invalid = 0
     pending: list[tuple] = []
     last_status_at = 0
@@ -182,6 +189,8 @@ def import_snapshot() -> dict:
         assert process.stdout is not None
         for raw_line in process.stdout:
             seen += 1
+            stream_bytes += len(raw_line)
+            stream_hash.update(raw_line)
             if len(raw_line) > MAX_LINE_BYTES:
                 invalid += 1
             elif b'"Company"' in raw_line:
@@ -214,6 +223,15 @@ def import_snapshot() -> dict:
         if return_code != 0:
             error = process.stderr.read(4096).decode("utf-8", errors="replace") if process.stderr else "curl failed"
             raise RuntimeError(f"Загрузка OpenSanctions завершилась с кодом {return_code}: {error[:300]}")
+        if stream_bytes != index["resource_size"]:
+            raise RuntimeError(f"Размер FTM stream не совпал: ожидалось {index['resource_size']}, получено {stream_bytes}")
+        if stream_hash.hexdigest() != index["resource_checksum"]:
+            raise RuntimeError("SHA-1 FTM stream не совпал с OpenSanctions index")
+        if invalid:
+            raise RuntimeError(f"FTM stream содержит некорректные строки: {invalid}")
+        expected_entities = index["entity_count"]
+        if seen != expected_entities:
+            raise RuntimeError(f"FTM stream неполный: ожидалось {expected_entities}, получено {seen}")
         if imported == 0:
             raise RuntimeError("В FTM snapshot не найдено ни одной Company с валидным ИНН")
         write_status(state="indexing", version=index["version"], imported=imported, scanned=seen)

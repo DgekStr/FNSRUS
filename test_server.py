@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import sqlite3
@@ -140,7 +141,7 @@ class APITests(unittest.TestCase):
                 "version": "20260912190833-iof", "updated_at": "2026-09-12T19:08:33",
                 "last_change": "2026-08-12T19:08:31", "entity_count": 2,
                 "resource_url": "https://data.opensanctions.org/artifacts/ru_egrul/20260912190833-iof/entities.ftm.json",
-                "resource_size": len(payload),
+                "resource_size": len(payload), "resource_checksum": hashlib.sha1(payload).hexdigest(),
             }
             with patch.object(opensanctions_import, "DATABASE", database_path), \
                     patch.object(opensanctions_import, "STATUS_FILE", status_path), \
@@ -173,6 +174,52 @@ class APITests(unittest.TestCase):
             write_status.assert_any_call(
                 state="running", version=index["version"], imported=1, scanned=1, invalid_lines=0,
             )
+
+    def test_opensanctions_stream_import_rejects_incomplete_data(self):
+        company = {
+            "id": "ru-ogrn-1027700132195",
+            "schema": "Company",
+            "properties": {"innCode": ["7707083893"], "ogrnCode": ["1027700132195"], "name": ["ПАО Сбербанк"]},
+        }
+        valid_line = json.dumps(company, ensure_ascii=False).encode() + b"\n"
+
+        class FakeProcess:
+            def __init__(self, payload):
+                self.stdout = io.BytesIO(payload)
+                self.stderr = io.BytesIO()
+
+            def poll(self):
+                return 0
+
+            def wait(self, timeout=None):
+                return 0
+
+        malformed_company_line = b'{"id":"bad","schema":"Company",bad-json}\n'
+        scenarios = (
+            (valid_line, 2, None, "FTM stream неполный"),
+            (valid_line + malformed_company_line, 2, None, "некорректные строки"),
+            (valid_line, 1, "0" * 40, "SHA-1 FTM stream не совпал"),
+        )
+        for payload, expected_entities, checksum, expected_error in scenarios:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "opensanctions.sqlite"
+                status_path = Path(directory) / "opensanctions-import-status.json"
+                index = {
+                    "version": "20260912190833-iof", "updated_at": "2026-09-12T19:08:33",
+                    "last_change": "2026-08-12T19:08:31", "entity_count": expected_entities,
+                    "resource_url": "https://data.opensanctions.org/artifacts/ru_egrul/20260912190833-iof/entities.ftm.json",
+                    "resource_size": len(payload),
+                    "resource_checksum": checksum or hashlib.sha1(payload).hexdigest(),
+                }
+                with patch.object(opensanctions_import, "DATABASE", database_path), \
+                        patch.object(opensanctions_import, "STATUS_FILE", status_path), \
+                        patch.object(opensanctions_import, "MIN_FREE_BYTES", 0), \
+                        patch.object(opensanctions_import, "fetch_index", return_value=index), \
+                        patch.object(opensanctions_import.subprocess, "Popen", return_value=FakeProcess(payload)):
+                    with self.assertRaisesRegex(RuntimeError, expected_error):
+                        opensanctions_import.import_snapshot()
+                self.assertFalse(database_path.exists())
+                self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "failed")
 
     def test_api_settings_roundtrip(self):
         headers = {"x-fns-settings": "1", "content-type": "application/json"}
