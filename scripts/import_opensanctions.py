@@ -23,6 +23,8 @@ DATABASE = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensan
 STATUS_FILE = Path("/var/lib/mcp-fns/opensanctions-import-status.json")
 MIN_FREE_BYTES = 4 * 1024**3
 BATCH_SIZE = 10_000
+BATCH_SIZE = 10_000
+STATUS_INTERVAL = 100_000
 MAX_LINE_BYTES = 2 * 1024**2
 DATASET_URL = "https://www.opensanctions.org/datasets/ru_egrul/"
 LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
@@ -179,28 +181,32 @@ def import_snapshot() -> dict:
         )
         assert process.stdout is not None
         for raw_line in process.stdout:
+            seen += 1
             if len(raw_line) > MAX_LINE_BYTES:
                 invalid += 1
-                continue
-            try:
-                entity = json.loads(raw_line)
-            except (UnicodeDecodeError, ValueError):
-                invalid += 1
-                continue
-            seen += 1
-            row = company_row(entity)
-            if row is None:
-                continue
-            pending.append(row)
-            if len(pending) >= BATCH_SIZE:
-                imported += insert_batch(connection, pending)
-                pending.clear()
+            else:
+                try:
+                    entity = json.loads(raw_line)
+                except (UnicodeDecodeError, ValueError):
+                    invalid += 1
+                else:
+                    row = company_row(entity)
+                    if row is not None:
+                        pending.append(row)
+                        if len(pending) >= BATCH_SIZE:
+                            imported += insert_batch(connection, pending)
+                            pending.clear()
+                            if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
+                                raise RuntimeError("Свободное место упало ниже 4 ГБ; импорт остановлен")
+            if seen - last_status_at >= STATUS_INTERVAL:
+                if pending:
+                    imported += insert_batch(connection, pending)
+                    pending.clear()
                 if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
                     raise RuntimeError("Свободное место упало ниже 4 ГБ; импорт остановлен")
-                if seen - last_status_at >= 100_000:
-                    write_status(state="running", version=index["version"], imported=imported, scanned=seen,
-                                 invalid_lines=invalid)
-                    last_status_at = seen
+                write_status(state="running", version=index["version"], imported=imported, scanned=seen,
+                             invalid_lines=invalid)
+                last_status_at = seen
         if pending:
             imported += insert_batch(connection, pending)
             pending.clear()

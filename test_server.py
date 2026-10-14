@@ -145,8 +145,10 @@ class APITests(unittest.TestCase):
             with patch.object(opensanctions_import, "DATABASE", database_path), \
                     patch.object(opensanctions_import, "STATUS_FILE", status_path), \
                     patch.object(opensanctions_import, "MIN_FREE_BYTES", 0), \
+                    patch.object(opensanctions_import, "STATUS_INTERVAL", 1), \
                     patch.object(opensanctions_import, "fetch_index", return_value=index), \
-                    patch.object(opensanctions_import.subprocess, "Popen", return_value=FakeProcess()):
+                    patch.object(opensanctions_import.subprocess, "Popen", return_value=FakeProcess()), \
+                    patch.object(opensanctions_import, "write_status", wraps=opensanctions_import.write_status) as write_status:
                 result = opensanctions_import.import_snapshot()
 
             database = sqlite3.connect(database_path)
@@ -166,6 +168,9 @@ class APITests(unittest.TestCase):
             self.assertEqual(metadata["license"], "CC BY-NC 4.0")
             self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "complete")
             self.assertFalse(list(Path(directory).glob("*.tmp")))
+            write_status.assert_any_call(
+                state="running", version=index["version"], imported=1, scanned=1, invalid_lines=0,
+            )
 
     def test_api_settings_roundtrip(self):
         headers = {"x-fns-settings": "1", "content-type": "application/json"}
