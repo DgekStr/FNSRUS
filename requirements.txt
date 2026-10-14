@@ -3,3 +3,4 @@ uvicorn==0.54.0
 httpx==0.28.1
 mcp==2.3.0
 jsonschema==4.26.0
+atomno-mcp-egrul==0.1.10

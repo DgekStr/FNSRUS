@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from collections import deque
+from ipaddress import ip_address, ip_network
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -22,8 +24,13 @@ import api_fns
 BASE_DIR = Path(__file__).resolve().parent
 APP_VERSION = (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
 MCP_VERSION = "0.1.12"
+MCP_EGRUL_VERSION = "0.1.10"
 CALL_TIMEOUT = 50
+EGRUL_CALL_TIMEOUT = CALL_TIMEOUT
 MAX_CALLS_PER_MINUTE = 10
+MAX_SEARCH_RESULTS = 50
+SEARCH_UNAVAILABLE_MESSAGE = "Поиск по названию временно недоступен, введите ИНН"
+SEARCH_DATA_UNAVAILABLE_MESSAGE = "База ЕГРЮЛ не загружена. Импортируйте официальный набор данных ФНС."
 TOOL_NAMES = frozenset({
     "check_contractor", "check_inn", "check_ogrn", "get_legal_status",
     "get_okveds", "get_directors_history", "check_for_red_flags",
@@ -33,6 +40,28 @@ logger = logging.getLogger("fnsrus")
 call_lock = asyncio.Lock()
 settings_lock = asyncio.Lock()
 recent_calls = deque()
+DEFAULT_SETTINGS_LAN_NETWORKS = "192.168.0.0/24,127.0.0.0/8,::1/128"
+
+
+def is_settings_client_allowed(request):
+    client = request.client
+    if client is None:
+        return False
+    try:
+        address = ip_address(client.host)
+    except ValueError:
+        return False
+    if address.version == 6 and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    configured_networks = os.environ.get("FNS_SETTINGS_LAN_NETWORKS", DEFAULT_SETTINGS_LAN_NETWORKS)
+    for item in configured_networks.split(","):
+        try:
+            network = ip_network(item.strip(), strict=False)
+        except ValueError:
+            continue
+        if address.version == network.version and address in network:
+            return True
+    return False
 
 
 class APIError(Exception):
@@ -46,7 +75,12 @@ class APIError(Exception):
 
 class CheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    identifier: str = Field(strict=True, pattern=r"^(?:[0-9]{10}|[0-9]{12}|[0-9]{13}|[0-9]{15})$")
+    identifier: str = Field(strict=True, min_length=1, max_length=200)
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(strict=True, min_length=2, max_length=200)
 
 
 class SettingsRequest(BaseModel):
@@ -117,6 +151,45 @@ async def invoke_mcp(name, arguments):
                     return decode_result(await session.call_tool(name, arguments))
 
 
+async def invoke_egrul_search(arguments):
+    database_path = Path(os.environ.get("MCP_EGRUL_DB", str(BASE_DIR / "data" / "egrul.sqlite")))
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    environment = {
+        name: value for name, value in os.environ.items()
+        if name not in {"FNS_API_KEY", "FNS_SETTINGS_TOKEN", "ATOMNO_API_KEY"}
+    }
+    environment.update({
+        "MCP_EGRUL_DB": str(database_path),
+        "MCP_EGRUL_DUMPS_DIR": os.environ.get("MCP_EGRUL_DUMPS_DIR", str(database_path.parent / "dumps")),
+        "MCP_EGRUL_LOG_LEVEL": "WARNING",
+        "FASTMCP_CHECK_FOR_UPDATES": "off",
+        "FASTMCP_SHOW_SERVER_BANNER": "false",
+    })
+    parameters = StdioServerParameters(
+        command=os.environ.get("UVX_PATH", "/home/deploy/.local/bin/uvx"),
+        args=["--from", f"atomno-mcp-egrul=={MCP_EGRUL_VERSION}", "atomno-mcp-egrul"],
+        env=environment,
+    )
+    async with stdio_client(parameters) as (reader, writer):
+        async with ClientSession(reader, writer) as session:
+            await session.initialize()
+            listing = await session.list_tools()
+            tools = {item.name: item for item in listing.tools}
+            ping_tool = tools.get("ping")
+            search_tool = tools.get("search_by_name")
+            if ping_tool is None or search_tool is None:
+                raise APIError(503, "tool_unavailable", SEARCH_UNAVAILABLE_MESSAGE)
+            if not Draft202012Validator(ping_tool.input_schema).is_valid({}):
+                raise APIError(503, "invalid_tool_schema", SEARCH_UNAVAILABLE_MESSAGE)
+            status = decode_result(await session.call_tool("ping", {}))
+            counts = status.get("counts")
+            if not isinstance(counts, dict) or not isinstance(counts.get("companies"), int) or counts["companies"] <= 0:
+                raise APIError(503, "search_data_unavailable", SEARCH_DATA_UNAVAILABLE_MESSAGE)
+            if not Draft202012Validator(search_tool.input_schema).is_valid(arguments):
+                raise APIError(503, "invalid_tool_schema", SEARCH_UNAVAILABLE_MESSAGE)
+            return decode_result(await session.call_tool("search_by_name", arguments))
+
+
 def find_api_error(error):
     if isinstance(error, APIError):
         return error
@@ -134,12 +207,7 @@ async def call_tool(name, arguments):
     if call_lock.locked():
         raise APIError(409, "busy", "Уже выполняется проверка. Дождитесь её завершения.")
     async with call_lock:
-        current_time = time.monotonic()
-        while recent_calls and current_time - recent_calls[0] >= 60:
-            recent_calls.popleft()
-        if len(recent_calls) >= MAX_CALLS_PER_MINUTE:
-            raise APIError(429, "rate_limit", "Превышен лимит, попробуйте через минуту.")
-        recent_calls.append(current_time)
+        record_call()
         try:
             async with asyncio.timeout(CALL_TIMEOUT):
                 settings = api_fns.load_settings()
@@ -156,6 +224,60 @@ async def call_tool(name, arguments):
                 raise api_error from error
             logger.error("MCP call failed: %s (%s)", name, type(error).__name__)
             raise APIError(502, "mcp_failure", "Сервис данных временно недоступен. Попробуйте позже.") from error
+
+
+def record_call():
+    current_time = time.monotonic()
+    while recent_calls and current_time - recent_calls[0] >= 60:
+        recent_calls.popleft()
+    if len(recent_calls) >= MAX_CALLS_PER_MINUTE:
+        raise APIError(429, "rate_limit", "Превышен лимит, попробуйте через минуту.")
+    recent_calls.append(current_time)
+
+
+def search_city(hit):
+    city = hit.get("city")
+    if isinstance(city, str) and city.strip():
+        return city.strip()
+    structured_address = hit.get("address_legal_structured")
+    if isinstance(structured_address, dict):
+        city = structured_address.get("city")
+        if isinstance(city, str) and city.strip():
+            return city.strip()
+    address = hit.get("address_legal")
+    if not isinstance(address, str) or not address.strip():
+        return "—"
+    city_match = re.search(r"(?<!\w)(?:г(?:ород)?\.?)\s+([^,;]+)", address, re.IGNORECASE)
+    if city_match:
+        return city_match.group(1).strip().rstrip(".")
+    return address.strip()[:30]
+
+
+async def call_search_by_name(query):
+    if call_lock.locked():
+        raise APIError(409, "busy", "Уже выполняется проверка. Дождитесь её завершения.")
+    async with call_lock:
+        record_call()
+        try:
+            async with asyncio.timeout(EGRUL_CALL_TIMEOUT):
+                payload = await invoke_egrul_search({"query": query, "limit": MAX_SEARCH_RESULTS})
+            hits = payload.get("hits")
+            if not isinstance(hits, list):
+                raise APIError(503, "invalid_search_response", SEARCH_UNAVAILABLE_MESSAGE)
+            results = []
+            for hit in hits[:MAX_SEARCH_RESULTS]:
+                if not isinstance(hit, dict) or not isinstance(hit.get("name"), str) or not isinstance(hit.get("inn"), str):
+                    raise APIError(503, "invalid_search_response", SEARCH_UNAVAILABLE_MESSAGE)
+                results.append({"name": hit["name"], "inn": hit["inn"], "city": search_city(hit)})
+            return {"results": results, "truncated": len(hits) >= MAX_SEARCH_RESULTS}
+        except Exception as error:
+            api_error = find_api_error(error)
+            if api_error is not None and api_error.code == "search_data_unavailable":
+                raise api_error from error
+            if api_error is not None and api_error.status == 429:
+                raise api_error from error
+            logger.warning("MCP name search failed (%s)", type(error).__name__)
+            raise APIError(503, "search_unavailable", SEARCH_UNAVAILABLE_MESSAGE) from error
 
 
 app = FastAPI(title="ФНС РУС", version=APP_VERSION, docs_url=None, redoc_url=None, openapi_url=None)
@@ -175,6 +297,8 @@ async def api_error_handler(request, error):
 async def validation_error_handler(request, error):
     if request.url.path.startswith("/api/settings/"):
         return JSONResponse({"error": "invalid_settings", "message": "Проверьте параметры настроек и формат API-ключа."}, status_code=422)
+    if request.url.path == "/api/search":
+        return JSONResponse({"error": "invalid_parameters", "message": "Введите название компании минимум из 2 символов."}, status_code=422)
     return JSONResponse(
         {"error": "invalid_parameters", "message": "Введите ИНН из 10 или 12 цифр либо ОГРН из 13 или 15 цифр. Передавайте параметры JSON-объектом."},
         status_code=422,
@@ -183,6 +307,12 @@ async def validation_error_handler(request, error):
 
 @app.middleware("http")
 async def protect_requests(request: Request, call_next):
+    if request.url.path.startswith("/api/settings/") and not is_settings_client_allowed(request):
+        return JSONResponse(
+            {"error": "local_network_only", "message": "Настройки API доступны только из локальной сети."},
+            status_code=403,
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
     if request.method in {"POST", "DELETE"}:
         origin = request.headers.get("origin")
         if (origin and origin != str(request.base_url).rstrip("/")) or request.headers.get("sec-fetch-site") == "cross-site":
@@ -264,7 +394,24 @@ async def delete_api_settings():
 
 @app.post("/api/check")
 async def check_contractor(body: CheckRequest):
-    return await call_tool("check_contractor", {"identifier": body.identifier})
+    identifier = body.identifier.strip()
+    if not identifier:
+        raise APIError(422, "invalid_parameters", "Введите ИНН, ОГРН или название компании.")
+    if re.fullmatch(r"[0-9]+", identifier):
+        if len(identifier) not in {10, 12, 13, 15}:
+            raise APIError(422, "invalid_parameters", "Введите ИНН из 10 или 12 цифр либо ОГРН из 13 или 15 цифр.")
+        return await call_tool("check_contractor", {"identifier": identifier})
+    if len(identifier) < 2:
+        raise APIError(422, "invalid_parameters", "Введите название компании минимум из 2 символов.")
+    return await call_search_by_name(identifier)
+
+
+@app.post("/api/search")
+async def search_by_name(body: SearchRequest):
+    query = body.query.strip()
+    if len(query) < 2:
+        raise APIError(422, "invalid_parameters", "Введите название компании минимум из 2 символов.")
+    return await call_search_by_name(query)
 
 
 @app.post("/api/tools/{tool_name}")

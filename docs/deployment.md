@@ -1,6 +1,6 @@
 # Развёртывание на Ubuntu 24.04
 
-Рабочий контейнер: `192.168.0.105`. Подключение: `ssh root@192.168.0.105`.
+Рабочий контейнер: `192.168.0.45`. Подключение: `ssh root@192.168.0.45`.
 Команды подготовки выполняются от root, приложение — от `deploy:www-data`.
 
 ## 1. Система и пользователь
@@ -30,6 +30,7 @@ runuser -u deploy -- ln -sf /home/deploy/.local/uv/bin/uvx /home/deploy/.local/b
 runuser -u deploy -- /home/deploy/.local/bin/uv --version
 runuser -u deploy -- /home/deploy/.local/bin/uvx --version
 runuser -u deploy -- /home/deploy/.local/bin/uvx --from atomno-mcp-fns-check==0.1.12 atomno-mcp-fns-check --help
+runuser -u deploy -- /home/deploy/.local/bin/uvx --from atomno-mcp-egrul==0.1.10 atomno-mcp-egrul --version
 ```
 
 Запускайте uv из `/srv/mcp-fns`, не из `/root`: иначе uv пытается искать
@@ -37,20 +38,42 @@ runuser -u deploy -- /home/deploy/.local/bin/uvx --from atomno-mcp-fns-check==0.
 `uvx --offline` с закреплённой версией, поэтому предварительное скачивание обязательно.
 Не удаляйте кэш uv без повторного скачивания пакета.
 
+### Первичная загрузка данных ЕГРЮЛ
+
+`mcp-egrul` не скачивает снимок автоматически. Сначала примите условия
+распространения open-data на сайте ФНС, затем вручную получите официальные ZIP
+файлы ЕГРЮЛ и поместите их в `/var/lib/mcp-fns/dumps/egrul/<дата>/`.
+Полный набор занимает около 15 ГБ; первичный импорт по оценке upstream занимает
+30-60 минут. Проверьте свободное место до загрузки.
+
+```bash
+install -d -o deploy -g www-data -m 0750 /var/lib/mcp-fns/dumps/egrul/2026-10-14
+# Скопируйте официальные ZIP-выгрузки в созданный каталог после принятия условий ФНС.
+runuser -u deploy -- env \
+  MCP_EGRUL_DB=/var/lib/mcp-fns/egrul.sqlite \
+  MCP_EGRUL_DUMPS_DIR=/var/lib/mcp-fns/dumps \
+  /home/deploy/.local/bin/uvx --from atomno-mcp-egrul==0.1.10 \
+  atomno-mcp-egrul-import --registry egrul --full
+```
+
+Первый импорт выполняется вручную, а не из HTTP-запроса. Пока база пуста,
+поиск вернёт явное сообщение о необходимости импорта; он не будет сообщать,
+что компания не найдена.
+
 ## 3. Файлы и зависимости
 
 Из Windows, до инициализации локального Git, можно передать полный проект:
 
 ```powershell
-scp -r C:/_project_/FNSRUS/. root@192.168.0.105:/srv/mcp-fns/
+scp -r C:/_project_/FNSRUS/. root@192.168.0.45:/srv/mcp-fns/
 ```
 
 После появления `.git` передавайте только файлы проекта, исключая `.git`,
 venv, `.env`, SQLite и резервные копии. Пример передачи рабочих каталогов:
 
 ```powershell
-scp -r C:/_project_/FNSRUS/templates C:/_project_/FNSRUS/static C:/_project_/FNSRUS/systemd C:/_project_/FNSRUS/nginx C:/_project_/FNSRUS/docs root@192.168.0.105:/srv/mcp-fns/
-scp C:/_project_/FNSRUS/server.py C:/_project_/FNSRUS/api_fns.py C:/_project_/FNSRUS/test_server.py C:/_project_/FNSRUS/VERSION C:/_project_/FNSRUS/requirements.txt C:/_project_/FNSRUS/README.md C:/_project_/FNSRUS/LICENSE C:/_project_/FNSRUS/.env.example root@192.168.0.105:/srv/mcp-fns/
+scp -r C:/_project_/FNSRUS/templates C:/_project_/FNSRUS/static C:/_project_/FNSRUS/systemd C:/_project_/FNSRUS/nginx C:/_project_/FNSRUS/docs root@192.168.0.45:/srv/mcp-fns/
+scp C:/_project_/FNSRUS/server.py C:/_project_/FNSRUS/api_fns.py C:/_project_/FNSRUS/test_server.py C:/_project_/FNSRUS/VERSION C:/_project_/FNSRUS/requirements.txt C:/_project_/FNSRUS/README.md C:/_project_/FNSRUS/LICENSE C:/_project_/FNSRUS/.env.example root@192.168.0.45:/srv/mcp-fns/
 ```
 
 На сервере:
@@ -92,6 +115,11 @@ install -m 0600 .env.example /etc/mcp-fns.env
 через UI, чтобы не менять окружение и не перезапускать сервис. В шаблоне ключ пустой.
 Основные параметры: `HOST`, `PORT`, `LOG_LEVEL`, `UVX_PATH`,
 `MCP_FNS_REGISTRIES_DB`, `FNS_SETTINGS_PATH`. Смена порта требует соответствующего изменения Nginx.
+Сеть доступа к настройкам задаётся `FNS_SETTINGS_LAN_NETWORKS` (по умолчанию
+`192.168.0.0/24,127.0.0.0/8,::1/128`). Изменяйте allowlist только на доверенные
+подсети; внешний доступ к `/api/settings/*` отвечает 403.
+В systemd для `mcp-egrul` закреплены `MCP_EGRUL_DB=/var/lib/mcp-fns/egrul.sqlite`
+и `MCP_EGRUL_DUMPS_DIR=/var/lib/mcp-fns/dumps`.
 
 Сохранённые через UI настройки находятся в `/var/lib/mcp-fns/api-fns-settings.json`
 с владельцем deploy и правами 0600. Этот файл содержит секрет: не выводите его
@@ -132,10 +160,11 @@ systemctl show mcp-fns-ui -p MemoryMax -p CPUQuotaPerSecUSec -p MemoryCurrent
 curl -fsS --retry 10 --retry-delay 1 --retry-all-errors --max-time 3 http://127.0.0.1/healthz
 curl -fsS http://127.0.0.1/static/app.js -o /dev/null
 curl -s http://127.0.0.1/api/check -H 'Content-Type: application/json' -d '{"identifier":"7707083893"}'
+curl -s http://127.0.0.1/api/search -H 'Content-Type: application/json' -d '{"query":"сбер"}'
 ```
 
 Статус `active` сам по себе не подтверждает готовность HTTP или источников.
-Откройте `http://192.168.0.105/`, проверьте Enter, очистку, неверный формат,
+Откройте `http://192.168.0.45/`, проверьте Enter, очистку, неверный формат,
 несуществующий ИНН и копирование. Размеры для проверки: 375, 768, 1440 px.
 Сопоставьте количество конечных полей JSON с количеством полей карточки.
 

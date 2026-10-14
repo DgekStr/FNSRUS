@@ -53,12 +53,15 @@ const form = document.getElementById("check-form");
 const input = document.getElementById("identifier");
 const checkButton = document.getElementById("check-button");
 const message = document.getElementById("form-message");
-const resultElement = document.getElementById("result");
-const emptyState = document.getElementById("empty-state");
+const contentView = document.getElementById("content-view");
+const searchResultsRows = document.getElementById("search-results-rows");
+const searchEmptyMessage = document.getElementById("search-empty-message");
+const returnToSearch = document.getElementById("return-to-search");
 let report = null;
 let activeController = null;
 let requestSequence = 0;
 let toastTimer = null;
+let searchQuery = "";
 
 function element(tag, className, text) {
   const node = document.createElement(tag);
@@ -182,6 +185,11 @@ function setMessage(text, isError = false) {
   message.classList.toggle("error", isError);
 }
 
+function setViewState(state) {
+  contentView.classList.remove("state-initial", "state-searching", "state-results", "state-card");
+  contentView.classList.add(`state-${state}`);
+}
+
 async function copyText(text) {
   try {
     if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
@@ -220,7 +228,7 @@ async function copyWithFeedback(button, value, defaultLabel) {
   }
 }
 
-function renderReport(data) {
+function renderReport(data, fromSearch = false) {
   report = data;
   document.getElementById("company-name").textContent = data.card?.name?.short || data.card?.name?.full || `Контрагент ${data.inn || data.identifier || ""}`;
   const verdict = document.getElementById("verdict-summary");
@@ -280,55 +288,158 @@ function renderReport(data) {
     sectionContainer.append(sectionElement);
   }
   document.getElementById("raw-json").textContent = JSON.stringify(data, null, 2);
-  resultElement.hidden = false;
-  emptyState.hidden = true;
+  returnToSearch.hidden = !fromSearch;
+  setViewState("card");
   refreshIcons();
 }
 
-function setBusy(busy) {
+function renderSearchResults(data, query) {
+  const results = data.results;
+  searchResultsRows.replaceChildren();
+  document.getElementById("search-result-count").textContent = results.length ? `Найдено совпадений: ${results.length}` : "";
+  searchEmptyMessage.textContent = results.length ? "" : `По запросу «${query}» ничего не найдено`;
+  searchEmptyMessage.classList.toggle("visible", results.length === 0);
+  document.getElementById("search-limit-note").hidden = !data.truncated;
+  for (const result of results) {
+    const row = element("tr");
+    const name = element("td", "search-result-name", result.name || "—");
+    name.dataset.label = "Название";
+    const innCell = element("td", "search-result-inn");
+    innCell.dataset.label = "ИНН";
+    const innButton = element("button", "inn-link", result.inn || "—");
+    innButton.type = "button";
+    innButton.dataset.inn = result.inn || "";
+    innButton.setAttribute("aria-label", `Открыть карточку по ИНН ${result.inn || ""}`);
+    innCell.append(innButton);
+    const city = element("td", "search-result-city", result.city || "—");
+    city.dataset.label = "Город";
+    row.append(name, innCell, city);
+    searchResultsRows.append(row);
+  }
+  setViewState("results");
+  refreshIcons();
+}
+
+function setBusy(busy, action = "check") {
   checkButton.disabled = busy;
-  checkButton.replaceChildren(icon(busy ? "loader-circle" : "search"), element("span", "", busy ? "Проверяем…" : "Проверить"));
+  const label = busy ? (action === "search" ? "Ищем…" : "Проверяем…") : "Найти / проверить";
+  checkButton.replaceChildren(icon(busy ? "loader-circle" : "search"), element("span", "", label));
   if (busy) checkButton.firstChild.classList.add("loading-icon");
   form.setAttribute("aria-busy", String(busy));
   refreshIcons();
 }
 
-form.addEventListener("submit", async event => {
-  event.preventDefault();
+async function parseApiResponse(response) {
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error("Сервер вернул некорректный ответ. Попробуйте позже."); }
+  if (!response.ok) throw new Error(data.message || data.message_ru || "Не удалось получить сведения. Попробуйте позже.");
+  return data;
+}
+
+async function searchByName(query) {
   if (checkButton.disabled) return;
-  const identifier = input.value.trim();
-  const validationError = validateIdentifier(identifier);
-  input.setAttribute("aria-invalid", String(Boolean(validationError)));
-  if (validationError) { setMessage(validationError, true); input.focus(); return; }
   const sequence = ++requestSequence;
-  activeController = new AbortController();
-  const browserTimeout = setTimeout(() => activeController?.abort(), 65000);
+  const controller = new AbortController();
+  activeController = controller;
   report = null;
-  resultElement.hidden = true;
-  emptyState.hidden = true;
-  setBusy(true);
-  setMessage("Получаем сведения из источников…");
+  searchQuery = query;
+  returnToSearch.hidden = true;
+  setViewState("searching");
+  document.getElementById("searching-title").textContent = "Ищем по названию…";
+  document.getElementById("searching-description").textContent = "Выполняем поиск в реестре ЕГРЮЛ.";
+  setBusy(true, "search");
+  setMessage("Идёт поиск…");
+  const browserTimeout = setTimeout(() => controller.abort(), 65000);
   try {
-    const response = await fetch("/api/check", {
+    const response = await fetch("/api/search", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ identifier }), signal: activeController.signal,
+      body: JSON.stringify({ query }), signal: controller.signal,
     });
-    let data;
-    try { data = await response.json(); }
-    catch { throw new Error("Сервер вернул некорректный ответ. Попробуйте позже."); }
-    if (!response.ok) throw new Error(data.message || data.message_ru || "Не удалось получить сведения. Попробуйте позже.");
-    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Сервер вернул некорректный ответ.");
+    const data = await parseApiResponse(response);
+    if (!data || !Array.isArray(data.results)) throw new Error("Сервер вернул некорректный ответ поиска.");
     if (sequence !== requestSequence) return;
-    renderReport(data);
-    setMessage("Проверка завершена.");
+    renderSearchResults(data, query);
+    setMessage("Поиск завершён.");
   } catch (error) {
     if (sequence !== requestSequence) return;
-    setMessage(error.name === "AbortError" ? "Проверка прервана по времени. Попробуйте позже." : error.message, true);
-    emptyState.hidden = false;
+    setViewState("initial");
+    setMessage(error.name === "AbortError" ? "Поиск прерван по времени. Попробуйте позже." : error.message, true);
   } finally {
     clearTimeout(browserTimeout);
     if (sequence === requestSequence) { activeController = null; setBusy(false); }
   }
+}
+
+async function checkIdentifier(identifier, fromSearch = false) {
+  if (checkButton.disabled) return;
+  if (!fromSearch) {
+    searchQuery = "";
+    returnToSearch.hidden = true;
+  }
+  const sequence = ++requestSequence;
+  const controller = new AbortController();
+  activeController = controller;
+  report = null;
+  setViewState("searching");
+  document.getElementById("searching-title").textContent = "Проверяем контрагента…";
+  document.getElementById("searching-description").textContent = "Получаем сведения из доступных источников.";
+  setBusy(true, "check");
+  setMessage("Получаем сведения из источников…");
+  const browserTimeout = setTimeout(() => controller.abort(), 65000);
+  try {
+    const response = await fetch("/api/check", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier }), signal: controller.signal,
+    });
+    const data = await parseApiResponse(response);
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Сервер вернул некорректный ответ.");
+    if (sequence !== requestSequence) return;
+    renderReport(data, fromSearch);
+    setMessage("Проверка завершена.");
+  } catch (error) {
+    if (sequence !== requestSequence) return;
+    input.value = fromSearch ? searchQuery : identifier;
+    setViewState(fromSearch ? "results" : "initial");
+    setMessage(error.name === "AbortError" ? "Проверка прервана по времени. Попробуйте позже." : error.message, true);
+  } finally {
+    clearTimeout(browserTimeout);
+    if (sequence === requestSequence) { activeController = null; setBusy(false); }
+  }
+}
+
+form.addEventListener("submit", event => {
+  event.preventDefault();
+  if (checkButton.disabled) return;
+  const value = input.value.trim();
+  input.removeAttribute("aria-invalid");
+  if (!value) { setMessage("Введите ИНН, ОГРН или название компании.", true); input.focus(); return; }
+  if (/^[0-9]+$/.test(value)) {
+    const validationError = validateIdentifier(value);
+    input.setAttribute("aria-invalid", String(Boolean(validationError)));
+    if (validationError) { setMessage(validationError, true); input.focus(); return; }
+    void checkIdentifier(value);
+    return;
+  }
+  if (value.length < 2) { setMessage("Введите минимум два символа для поиска.", true); input.focus(); return; }
+  void searchByName(value);
+});
+
+searchResultsRows.addEventListener("click", event => {
+  const button = event.target.closest("button[data-inn]");
+  if (!button || checkButton.disabled) return;
+  const inn = button.dataset.inn;
+  const validationError = validateIdentifier(inn);
+  if (validationError) { setMessage(validationError, true); return; }
+  input.value = inn;
+  void checkIdentifier(inn, true);
+});
+
+returnToSearch.addEventListener("click", () => {
+  input.value = searchQuery;
+  returnToSearch.hidden = true;
+  setViewState("results");
+  setMessage("Результаты поиска сохранены.");
 });
 
 input.addEventListener("input", () => { input.removeAttribute("aria-invalid"); if (message.classList.contains("error")) setMessage(""); });
@@ -337,12 +448,18 @@ document.getElementById("clear-button").addEventListener("click", () => {
   activeController?.abort();
   activeController = null;
   report = null;
+  searchQuery = "";
   form.reset();
   input.removeAttribute("aria-invalid");
   document.getElementById("sections").replaceChildren();
   document.getElementById("raw-json").textContent = "";
-  resultElement.hidden = true;
-  emptyState.hidden = false;
+  searchResultsRows.replaceChildren();
+  document.getElementById("search-result-count").textContent = "";
+  searchEmptyMessage.textContent = "";
+  searchEmptyMessage.classList.remove("visible");
+  document.getElementById("search-limit-note").hidden = true;
+  returnToSearch.hidden = true;
+  setViewState("initial");
   setMessage("");
   setBusy(false);
   input.focus();
@@ -352,6 +469,7 @@ document.getElementById("copy-all").addEventListener("click", event => {
 });
 
 const settingsDialog = document.getElementById("api-settings");
+const settingsAccessDialog = document.getElementById("settings-access-denied");
 const settingsForm = document.getElementById("settings-form");
 const apiKeyInput = document.getElementById("api-key");
 const apiEnabled = document.getElementById("api-enabled");
@@ -380,7 +498,11 @@ async function settingsRequest(method = "GET", body, suffix = "") {
   let data;
   try { data = await response.json(); }
   catch { throw new Error("Сервер вернул некорректный ответ настроек."); }
-  if (!response.ok) throw new Error(data.message || "Не удалось изменить настройки API.");
+  if (!response.ok) {
+    const error = new Error(data.message || "Не удалось изменить настройки API.");
+    error.code = data.error;
+    throw error;
+  }
   return data;
 }
 
@@ -413,12 +535,21 @@ document.getElementById("settings-open").addEventListener("click", async () => {
   apiKeyInput.value = "";
   settingsFeedback("");
   document.getElementById("settings-security").hidden = location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname);
-  settingsDialog.showModal();
-  try { showSettings(await settingsRequest()); }
-  catch (error) { settingsFeedback(error.message, true); }
+  try {
+    showSettings(await settingsRequest());
+    settingsDialog.showModal();
+  } catch (error) {
+    if (error.code === "local_network_only") {
+      settingsAccessDialog.showModal();
+      return;
+    }
+    settingsDialog.showModal();
+    settingsFeedback(error.message, true);
+  }
 });
 document.getElementById("settings-close").addEventListener("click", () => settingsDialog.close());
 settingsDialog.addEventListener("close", () => { apiKeyInput.value = ""; });
+document.getElementById("settings-access-denied-close").addEventListener("click", () => settingsAccessDialog.close());
 settingsForm.addEventListener("submit", event => {
   event.preventDefault();
   const key = apiKeyInput.value.trim();

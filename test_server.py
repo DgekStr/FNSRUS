@@ -24,13 +24,16 @@ class APITests(unittest.TestCase):
         settings_path = patch.object(api_fns, "SETTINGS_PATH", Path(directory.name) / "settings.json")
         settings_path.start()
         self.addCleanup(settings_path.stop)
-        environment = patch.dict(os.environ, {"FNS_API_KEY": ""})
+        environment = patch.dict(os.environ, {
+            "FNS_API_KEY": "",
+            "FNS_SETTINGS_LAN_NETWORKS": "192.168.0.0/24,127.0.0.0/8,::1/128",
+        })
         environment.start()
         self.addCleanup(environment.stop)
-        self.client = TestClient(server.app)
+        self.client = TestClient(server.app, client=("192.168.0.10", 12345))
 
     def test_release_version(self):
-        self.assertEqual(server.APP_VERSION, "1.0")
+        self.assertEqual(server.APP_VERSION, "1.2")
         self.assertEqual(server.app.version, server.APP_VERSION)
 
     def test_api_settings_roundtrip(self):
@@ -94,6 +97,24 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("short", response.text)
         self.assertEqual(self.client.post("/api/settings/api-fns", headers=headers, json={"enabled": True}).status_code, 422)
+
+    def test_api_settings_are_restricted_to_lan(self):
+        local_response = self.client.get("/api/settings/api-fns")
+        self.assertEqual(local_response.status_code, 200)
+
+        remote_client = TestClient(server.app, client=("203.0.113.45", 54321))
+        requests = (
+            ("GET", "/api/settings/api-fns", {}),
+            ("POST", "/api/settings/api-fns", {"json": {"enabled": False}}),
+            ("POST", "/api/settings/api-fns/test", {}),
+            ("DELETE", "/api/settings/api-fns", {}),
+        )
+        for method, path, options in requests:
+            response = remote_client.request(method, path, **options)
+            self.assertEqual(response.status_code, 403)
+            self.assertEqual(response.json()["error"], "local_network_only")
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertEqual(response.headers["x-content-type-options"], "nosniff")
 
     def test_invalid_key_replacement_preserves_saved_key(self):
         api_fns.save_settings({"api_key": "original-fake-key", "enabled": True})
@@ -285,6 +306,80 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), payload)
 
+    def test_name_input_and_search_endpoint(self):
+        search_calls = []
+        checked = []
+
+        async def fake_search(arguments):
+            search_calls.append(arguments)
+            return {"hits": [{"name": "ПАО Сбербанк", "inn": "7707083893", "address_legal": "г. Москва, ул. Вавилова"}]}
+
+        async def fake_check(name, arguments):
+            checked.append((name, arguments))
+            return {"tool": name, "arguments": arguments}
+
+        with patch.object(server, "invoke_egrul_search", fake_search), patch.object(server, "call_tool", fake_check):
+            for identifier in ("1234567890", "123456789012", "1234567890123", "123456789012345"):
+                response = self.client.post("/api/check", json={"identifier": identifier})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["arguments"], {"identifier": identifier})
+
+            response = self.client.post("/api/check", json={"identifier": "  Сбер  "})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["results"], [{"name": "ПАО Сбербанк", "inn": "7707083893", "city": "Москва"}])
+
+            response = self.client.post("/api/search", json={"query": "  Сбер  "})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["results"][0]["inn"], "7707083893")
+
+        self.assertEqual(len(checked), 4)
+        self.assertTrue(all(name == "check_contractor" for name, _ in checked))
+        self.assertEqual(search_calls, [{"query": "Сбер", "limit": 50}, {"query": "Сбер", "limit": 50}])
+
+    def test_search_caps_results_and_extracts_city(self):
+        hits = [
+            {"name": f"Компания {index}", "inn": f"{index:010d}", "address_legal": "Российская Федерация, регион, адрес"}
+            for index in range(51)
+        ]
+        hits[0]["address_legal_structured"] = {"city": "Тула"}
+        hits[1]["address_legal"] = "г. Москва, ул. Вавилова, д. 1"
+        hits[2]["address_legal"] = "Очень длинный адрес без выделенного города, улица и дом"
+        hits[3].pop("address_legal")
+
+        async def fake_search(arguments):
+            self.assertEqual(arguments, {"query": "компания", "limit": 50})
+            return {"hits": hits, "count": len(hits)}
+
+        with patch.object(server, "invoke_egrul_search", fake_search):
+            response = self.client.post("/api/search", json={"query": "компания"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["results"]), 50)
+        self.assertTrue(payload["truncated"])
+        self.assertTrue(all(set(item) == {"name", "inn", "city"} for item in payload["results"]))
+        self.assertEqual([item["city"] for item in payload["results"][:4]], [
+            "Тула", "Москва", hits[2]["address_legal"][:30], "—",
+        ])
+
+    def test_search_reports_empty_database_and_unavailable_server(self):
+        async def empty_database(arguments):
+            raise server.APIError(503, "search_data_unavailable", server.SEARCH_DATA_UNAVAILABLE_MESSAGE)
+
+        with patch.object(server, "invoke_egrul_search", empty_database):
+            response = self.client.post("/api/search", json={"query": "сбер"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["message"], server.SEARCH_DATA_UNAVAILABLE_MESSAGE)
+
+        async def unavailable(arguments):
+            raise RuntimeError("uvx is unavailable")
+
+        with patch.object(server, "invoke_egrul_search", unavailable):
+            response = self.client.post("/api/search", json={"query": "сбер"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["message"], "Поиск по названию временно недоступен, введите ИНН")
+        self.assertEqual(self.client.post("/api/search", json={"query": "я"}).status_code, 422)
+
     def test_seven_tools_allowed(self):
         async def fake_call(name, arguments):
             return {"tool": name, "arguments": arguments}
@@ -296,7 +391,7 @@ class APITests(unittest.TestCase):
                 self.assertEqual(response.json()["tool"], name)
 
     def test_invalid_format_and_json(self):
-        for body in ({"identifier": "bad"}, {"identifier": 7707083893}, {"identifier": "7707083893", "extra": 1}):
+        for body in ({"identifier": "12345"}, {"identifier": 7707083893}, {"identifier": "7707083893", "extra": 1}):
             response = self.client.post("/api/check", json=body)
             self.assertEqual(response.status_code, 422)
             self.assertIn("Введите ИНН", response.json()["message"])

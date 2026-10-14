@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
-  <link rel="stylesheet" href="/static/style.css?v=4">
+  <link rel="stylesheet" href="/static/style.css?v=6">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=5"></script>
+  <script type="module" src="/static/app.js?v=7"></script>
 </head>
 <body>
   <header class="site-header">
@@ -22,23 +22,48 @@
     <section class="search-section" aria-labelledby="search-heading">
       <h1 id="search-heading">Проверка контрагента</h1>
       <form id="check-form" novalidate>
-        <label for="identifier">ИНН или ОГРН</label>
+        <label for="identifier">ИНН, ОГРН или название компании</label>
         <div class="search-controls">
-          <input id="identifier" name="identifier" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="15" placeholder="7707083893" aria-describedby="form-message" autofocus>
-          <button id="check-button" class="button button-primary" type="submit"><i data-lucide="search" aria-hidden="true"></i><span>Проверить</span></button>
+          <input id="identifier" name="identifier" type="text" inputmode="search" autocomplete="off" spellcheck="false" maxlength="200" placeholder="7707083893 или Сбербанк" aria-describedby="form-message" autofocus>
+          <button id="check-button" class="button button-primary" type="submit"><i data-lucide="search" aria-hidden="true"></i><span>Найти / проверить</span></button>
           <button id="clear-button" class="button button-secondary" type="button" title="Очистить форму и результат"><i data-lucide="rotate-ccw" aria-hidden="true"></i><span>Очистить</span></button>
         </div>
       </form>
       <div id="form-message" class="form-message" role="status" aria-live="polite"></div>
     </section>
 
-    <section id="empty-state" class="empty-state" aria-label="Результат проверки">
-      <i data-lucide="files" aria-hidden="true"></i>
-      <h2>Результат проверки</h2>
-      <p>Нет данных</p>
-    </section>
+    <div id="content-view" class="content-view state-initial">
+      <section id="empty-state" class="empty-state" aria-label="Результат проверки">
+        <i data-lucide="files" aria-hidden="true"></i>
+        <h2>Результат проверки</h2>
+        <p>Введите ИНН, ОГРН или название компании</p>
+      </section>
 
-    <article id="result" hidden aria-label="Карточка контрагента">
+      <section id="searching-state" class="searching-state" role="status" aria-live="polite">
+        <i data-lucide="loader-circle" class="loading-icon" aria-hidden="true"></i>
+        <h2 id="searching-title">Выполняется поиск…</h2>
+        <p id="searching-description"></p>
+      </section>
+
+      <section id="search-results" class="search-results" aria-labelledby="search-results-heading">
+        <div class="search-results-heading">
+          <div>
+            <h2 id="search-results-heading">Результаты поиска</h2>
+            <p id="search-result-count" class="search-result-count"></p>
+          </div>
+        </div>
+        <p id="search-empty-message" class="search-empty-message" role="status" aria-live="polite"></p>
+        <p id="search-limit-note" class="search-limit-note" hidden>Показаны первые 50 результатов, уточните запрос.</p>
+        <div class="search-results-scroll">
+          <table class="search-results-table">
+            <thead><tr><th scope="col">Название</th><th scope="col">ИНН</th><th scope="col">Город</th></tr></thead>
+            <tbody id="search-results-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <article id="result" aria-label="Карточка контрагента">
+      <button id="return-to-search" class="button button-secondary return-to-search" type="button" hidden><i data-lucide="arrow-left" aria-hidden="true"></i><span>Вернуться к результатам поиска</span></button>
       <div class="result-heading">
         <div><span class="overline">Карточка контрагента</span><h2 id="company-name"></h2></div>
         <button id="copy-all" class="button button-secondary" type="button"><i data-lucide="copy" aria-hidden="true"></i><span>Копировать всё</span></button>
@@ -48,7 +73,8 @@
       <div id="verdict-summary" class="verdict-band" role="status"></div>
       <div id="coverage-summary" class="coverage-summary"></div>
       <details class="raw-data"><summary>Исходные данные</summary><pre id="raw-json"></pre></details>
-    </article>
+      </article>
+    </div>
   </main>
 
   <dialog id="api-settings" class="settings-dialog" aria-labelledby="settings-heading">
@@ -63,7 +89,14 @@
       <div id="settings-message" class="form-message" role="status" aria-live="polite"></div>
     </form>
   </dialog>
-  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a></p></div></footer>
+  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a> · <span class="footer-version">Версия 1.2</span></p></div></footer>
+  <dialog id="settings-access-denied" class="access-denied-dialog" aria-labelledby="settings-access-denied-message">
+    <div class="access-denied-content">
+      <img class="access-denied-image" src="/static/you-didnt-say-the-magic-word-ah-ah.gif" alt="Анимированная картинка: «Ах-ах-ах!»" width="498" height="420">
+      <p id="settings-access-denied-message" class="access-denied-message">Ай-Ай-Ай! ТЫ НЕ СКАЗАЛ ВОЛШЕБНОЕ СЛОВО!</p>
+      <button id="settings-access-denied-close" class="button button-primary" type="button">Закрыть</button>
+    </div>
+  </dialog>
   <div id="copy-status" class="copy-status" role="status" aria-live="polite" hidden></div>
 </body>
 </html>
