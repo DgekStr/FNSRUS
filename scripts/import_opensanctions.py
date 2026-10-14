@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -21,7 +22,7 @@ DATASET = "ru_egrul"
 INDEX_URL = f"https://data.opensanctions.org/datasets/latest/{DATASET}/index.json"
 PROXY = "socks5h://10.8.0.1:19450"
 DATABASE = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
-STATUS_FILE = Path("/var/lib/mcp-fns/opensanctions-import-status.json")
+STATUS_FILE = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
 MIN_FREE_BYTES = 4 * 1024**3
 BATCH_SIZE = 10_000
 BATCH_SIZE = 10_000
@@ -29,6 +30,42 @@ STATUS_INTERVAL = 100_000
 MAX_LINE_BYTES = 2 * 1024**2
 DATASET_URL = "https://www.opensanctions.org/datasets/ru_egrul/"
 LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
+
+
+class ImportBusyError(RuntimeError):
+    pass
+
+
+class ImportNotReadyError(RuntimeError):
+    pass
+
+
+class InvalidImportDatabaseError(RuntimeError):
+    pass
+
+
+@contextmanager
+def dataset_lock(database: Path):
+    lock_path = database.with_name(f".{database.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    locked = False
+    try:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ImportBusyError("Импорт или публикация уже выполняется") from error
+            locked = True
+        yield
+    finally:
+        if locked:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def curl_command(url: str) -> list[str]:
@@ -106,16 +143,16 @@ def company_row(entity: dict) -> tuple | None:
     return inn, ogrn, name, city, str(entity.get("id") or "")
 
 
-def write_status(**updates) -> None:
-    STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+def write_status_file(status_file: Path, **updates) -> None:
+    status_file.parent.mkdir(parents=True, exist_ok=True)
     current = {}
     try:
-        current = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+        current = json.loads(status_file.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pass
     current.update(updates)
     current["updated_at"] = datetime.now(UTC).isoformat()
-    descriptor, temporary = tempfile.mkstemp(prefix=".opensanctions-status-", dir=STATUS_FILE.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=".opensanctions-status-", dir=status_file.parent)
     try:
         os.fchmod(descriptor, 0o640)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -123,10 +160,14 @@ def write_status(**updates) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, STATUS_FILE)
+        os.replace(temporary, status_file)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def write_status(**updates) -> None:
+    write_status_file(STATUS_FILE, **updates)
 
 
 def create_database(path: Path) -> sqlite3.Connection:
@@ -161,7 +202,7 @@ def insert_batch(connection: sqlite3.Connection, rows: list[tuple]) -> int:
     return connection.total_changes - before
 
 
-def import_snapshot() -> dict:
+def _import_snapshot_locked() -> dict:
     DATABASE.parent.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
         raise RuntimeError("Меньше 4 ГБ свободно; импорт остановлен до скачивания")
@@ -177,8 +218,11 @@ def import_snapshot() -> dict:
     invalid = 0
     pending: list[tuple] = []
     last_status_at = 0
+    staging_ready = False
     write_status(state="running", version=index["version"], source_updated_at=index["updated_at"],
-                 last_source_change=index["last_change"], expected_bytes=index["resource_size"], imported=0)
+                 last_source_change=index["last_change"], expected_bytes=index["resource_size"],
+                 expected_entities=index["entity_count"], imported=0, scanned=0,
+                 started_at=datetime.now(UTC).isoformat())
     try:
         process = subprocess.Popen(
             curl_command(index["resource_url"]),
@@ -259,13 +303,17 @@ def import_snapshot() -> dict:
         connection.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", metadata.items())
         connection.commit()
         connection.execute("PRAGMA optimize")
+        write_status(state="validating", version=index["version"], imported=imported, scanned=seen)
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError("SQLite staging database integrity check failed")
         connection.close()
         connection = None
-        os.replace(staging, DATABASE)
-        result = {"state": "complete", "version": index["version"], "imported": imported,
-                  "scanned": seen, "invalid_lines": invalid, "updated_at": index["updated_at"],
-                  "last_change": index["last_change"]}
+        result = {"state": "ready_to_publish", "version": index["version"], "imported": imported,
+                  "scanned": seen, "expected_entities": expected_entities, "invalid_lines": invalid,
+                  "updated_at": index["updated_at"], "last_change": index["last_change"]}
         write_status(**result)
+        staging_ready = True
         return result
     except Exception as error:
         if process is not None and process.poll() is None:
@@ -280,7 +328,60 @@ def import_snapshot() -> dict:
     finally:
         if connection is not None:
             connection.close()
-        staging.unlink(missing_ok=True)
+        if not staging_ready:
+            staging.unlink(missing_ok=True)
+
+
+def import_snapshot() -> dict:
+    with dataset_lock(DATABASE):
+        return _import_snapshot_locked()
+
+
+def publish_snapshot(database: Path = DATABASE, status_file: Path = STATUS_FILE) -> dict:
+    with dataset_lock(database):
+        try:
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ImportNotReadyError("Нет завершённого импорта для публикации") from error
+        if not isinstance(status, dict) or status.get("state") != "ready_to_publish":
+            raise ImportNotReadyError("Импорт ещё не завершён или уже опубликован")
+        version = status.get("version")
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version):
+            raise InvalidImportDatabaseError("Версия staging-базы некорректна")
+        staging = database.with_name(f".{database.name}.{version}.tmp")
+        if not staging.is_file() or staging.is_symlink():
+            raise InvalidImportDatabaseError("Готовая staging-база не найдена")
+        if status.get("invalid_lines", 0) != 0:
+            raise InvalidImportDatabaseError("В импорте обнаружены некорректные строки")
+        try:
+            connection = sqlite3.connect(staging.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                integrity = connection.execute("PRAGMA quick_check").fetchone()
+                if not integrity or integrity[0] != "ok":
+                    raise InvalidImportDatabaseError("SQLite staging database integrity check failed")
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                )}
+                if not {"companies", "companies_fts", "metadata"}.issubset(tables):
+                    raise InvalidImportDatabaseError("В staging-базе отсутствуют поисковые таблицы")
+                metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+                company_count = connection.execute("SELECT COUNT(*) FROM companies").fetchone()[0]
+                fts_count = connection.execute("SELECT COUNT(*) FROM companies_fts").fetchone()[0]
+            finally:
+                connection.close()
+        except (sqlite3.DatabaseError, OSError, ValueError) as error:
+            raise InvalidImportDatabaseError("Не удалось проверить staging-базу") from error
+        if (metadata.get("version") != version or
+                company_count != status.get("imported") or fts_count != company_count or
+                metadata.get("records_scanned") != str(status.get("scanned")) or
+                metadata.get("invalid_lines") != "0" or
+                status.get("scanned") != status.get("expected_entities")):
+            raise InvalidImportDatabaseError("Состав staging-базы не совпадает со статусом импорта")
+        os.replace(staging, database)
+        published_at = datetime.now(UTC).isoformat()
+        result = {**status, "state": "complete", "published": True, "published_at": published_at}
+        write_status_file(status_file, **result)
+        return result
 
 
 if __name__ == "__main__":

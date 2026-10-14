@@ -34,6 +34,11 @@ class APITests(unittest.TestCase):
         import_status_path = patch.object(server, "OPENSANCTIONS_STATUS_PATH", Path(directory.name) / "import-status.json")
         import_status_path.start()
         self.addCleanup(import_status_path.stop)
+        database_path = patch.object(server, "OPENSANCTIONS_DB", Path(directory.name) / "opensanctions.sqlite")
+        database_path.start()
+        self.addCleanup(database_path.stop)
+        server.opensanctions_progress_samples.clear()
+        server.opensanctions_progress_run = None
         environment = patch.dict(os.environ, {
             "FNS_API_KEY": "",
             "FNS_SETTINGS_LAN_NETWORKS": "192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128",
@@ -156,7 +161,10 @@ class APITests(unittest.TestCase):
                     patch.object(opensanctions_import, "write_status", wraps=opensanctions_import.write_status) as write_status:
                 result = opensanctions_import.import_snapshot()
 
-            database = sqlite3.connect(database_path)
+            staging_path = database_path.with_name(f".opensanctions.sqlite.{index['version']}.tmp")
+            self.assertFalse(database_path.exists())
+            self.assertTrue(staging_path.exists())
+            database = sqlite3.connect(staging_path)
             try:
                 row = database.execute("SELECT inn, name, city FROM companies").fetchone()
                 match_count = database.execute(
@@ -166,17 +174,22 @@ class APITests(unittest.TestCase):
             finally:
                 database.close()
 
-            self.assertEqual(result["state"], "complete")
+            self.assertEqual(result["state"], "ready_to_publish")
             self.assertEqual(result["imported"], 1)
             convert_company.assert_called_once()
             self.assertEqual(row, ("7707083893", "ПАО Сбербанк", "Москва"))
             self.assertEqual(match_count, 1)
             self.assertEqual(metadata["license"], "CC BY-NC 4.0")
-            self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "complete")
-            self.assertFalse(list(Path(directory).glob("*.tmp")))
+            self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "ready_to_publish")
             write_status.assert_any_call(
                 state="running", version=index["version"], imported=1, scanned=1, invalid_lines=0,
             )
+
+            result = opensanctions_import.publish_snapshot(database_path, status_path)
+            self.assertEqual(result["state"], "complete")
+            self.assertTrue(database_path.exists())
+            self.assertFalse(staging_path.exists())
+            self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "complete")
 
     def test_opensanctions_stream_import_rejects_incomplete_data(self):
         company = {
@@ -223,6 +236,89 @@ class APITests(unittest.TestCase):
                         opensanctions_import.import_snapshot()
                 self.assertFalse(database_path.exists())
                 self.assertEqual(json.loads(status_path.read_text(encoding="utf-8"))["state"], "failed")
+
+    def test_opensanctions_settings_reports_average_eta(self):
+        status_path = server.OPENSANCTIONS_STATUS_PATH
+        status = {
+            "state": "running", "version": "20260912190833-iof", "started_at": "2026-10-14T12:00:00+00:00",
+            "scanned": 100, "expected_entities": 1000, "imported": 1,
+            "updated_at": "2026-10-14T12:00:00+00:00", "invalid_lines": 0,
+        }
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        first = self.client.get("/api/settings/opensanctions").json()
+        self.assertEqual(first["progress_percent"], 10.0)
+        self.assertIsNone(first["average_rate_per_second"])
+        self.assertFalse(first["can_publish"])
+
+        status.update(scanned=400, updated_at="2026-10-14T12:01:00+00:00")
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        second = self.client.get("/api/settings/opensanctions").json()
+        self.assertEqual(second["average_rate_per_second"], 5.0)
+        self.assertEqual(second["eta_seconds"], 120)
+
+    def test_opensanctions_publish_endpoint_validates_and_publishes(self):
+        version = "20260912190833-iof"
+        database_path = server.OPENSANCTIONS_DB
+        staging = database_path.with_name(f".{database_path.name}.{version}.tmp")
+        connection = create_database(staging)
+        insert_batch(connection, [("7707083893", "1027700132195", "ПАО Сбербанк", "Москва", "entity-1")])
+        connection.execute("""
+            CREATE VIRTUAL TABLE companies_fts USING fts5(
+                name, content='companies', content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+        connection.execute("INSERT INTO companies_fts(companies_fts) VALUES ('rebuild')")
+        connection.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", [
+            ("version", version), ("companies", "1"), ("records_scanned", "1"), ("invalid_lines", "0"),
+        ])
+        connection.commit()
+        connection.close()
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({
+            "state": "ready_to_publish", "version": version, "scanned": 1,
+            "expected_entities": 1, "imported": 1, "invalid_lines": 0,
+        }), encoding="utf-8")
+
+        headers = {"x-fns-settings": "1", "content-type": "application/json"}
+        status = self.client.get("/api/settings/opensanctions").json()
+        self.assertTrue(status["can_publish"])
+        response = self.client.post("/api/settings/opensanctions/publish", headers=headers, json={})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["state"], "complete")
+        self.assertTrue(database_path.is_file())
+        self.assertFalse(staging.exists())
+        self.assertEqual(json.loads(server.OPENSANCTIONS_STATUS_PATH.read_text(encoding="utf-8"))["state"], "complete")
+
+    def test_opensanctions_publish_rejects_running_import(self):
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({"state": "running"}), encoding="utf-8")
+        response = self.client.post(
+            "/api/settings/opensanctions/publish",
+            headers={"x-fns-settings": "1", "content-type": "application/json"},
+            json={},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "import_not_ready")
+
+    def test_opensanctions_publish_rejects_corrupt_staging_without_replacing_database(self):
+        version = "20260912190833-iof"
+        database_path = server.OPENSANCTIONS_DB
+        database_path.write_bytes(b"active database")
+        staging = database_path.with_name(f".{database_path.name}.{version}.tmp")
+        staging.write_bytes(b"corrupt staging")
+        server.OPENSANCTIONS_STATUS_PATH.write_text(json.dumps({
+            "state": "ready_to_publish", "version": version, "scanned": 1,
+            "expected_entities": 1, "imported": 1, "invalid_lines": 0,
+        }), encoding="utf-8")
+
+        response = self.client.post(
+            "/api/settings/opensanctions/publish",
+            headers={"x-fns-settings": "1", "content-type": "application/json"},
+            json={},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"], "invalid_import_database")
+        self.assertEqual(database_path.read_bytes(), b"active database")
+        self.assertTrue(staging.exists())
 
     def test_api_settings_roundtrip(self):
         headers = {"x-fns-settings": "1", "content-type": "application/json"}
@@ -280,11 +376,13 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
         headers = {"x-fns-settings": "1", "content-type": "application/json", "origin": "http://untrusted.example"}
         self.assertEqual(self.client.delete("/api/settings/api-fns", headers=headers).status_code, 403)
+        self.assertEqual(self.client.post("/api/settings/opensanctions/publish", headers=headers, json={}).status_code, 403)
         headers.pop("origin")
         response = self.client.post("/api/settings/api-fns", headers=headers, json={"api_key": "short", "enabled": True})
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("short", response.text)
         self.assertEqual(self.client.post("/api/settings/api-fns", headers=headers, json={"enabled": True}).status_code, 422)
+        self.assertEqual(self.client.post("/api/settings/opensanctions/publish", json={}).status_code, 403)
 
     def test_api_settings_are_restricted_to_lan(self):
         local_response = self.client.get("/api/settings/api-fns")
@@ -301,6 +399,8 @@ class APITests(unittest.TestCase):
             ("DELETE", "/api/settings/api-fns", {}),
             ("GET", "/api/settings/wireguard", {}),
             ("POST", "/api/settings/wireguard", {"json": {"enabled": True}}),
+            ("GET", "/api/settings/opensanctions", {}),
+            ("POST", "/api/settings/opensanctions/publish", {"json": {}}),
         )
         for method, path, options in requests:
             response = remote_client.request(method, path, **options)

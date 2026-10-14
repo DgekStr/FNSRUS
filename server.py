@@ -8,8 +8,10 @@ import sqlite3
 import tempfile
 import time
 from collections import deque
+from datetime import datetime, timezone
 from ipaddress import ip_address, ip_network
 from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,6 +23,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 import api_fns
+import scripts.import_opensanctions as opensanctions_import
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,6 +39,7 @@ SEARCH_DATA_UNAVAILABLE_MESSAGE = "База ЕГРЮЛ не загружена. 
 WIREGUARD_CONTROL_SOCKET = Path(os.environ.get("FNS_WG_CONTROL_SOCKET", "/run/fnsrus-wg-control.sock"))
 OPENSANCTIONS_DB = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
 OPENSANCTIONS_STATUS_PATH = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
+OPENSANCTIONS_ENTITY_COUNTS = {"20260912190833-iof": 53_107_328}
 TOOL_NAMES = frozenset({
     "check_contractor", "check_inn", "check_ogrn", "get_legal_status",
     "get_okveds", "get_directors_history", "check_for_red_flags",
@@ -45,6 +49,9 @@ logger = logging.getLogger("fnsrus")
 call_lock = asyncio.Lock()
 settings_lock = asyncio.Lock()
 recent_calls = deque()
+opensanctions_progress_samples = deque(maxlen=6)
+opensanctions_progress_lock = Lock()
+opensanctions_progress_run = None
 DEFAULT_SETTINGS_LAN_NETWORKS = "192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::1/128"
 
 
@@ -306,12 +313,88 @@ def search_opensanctions_database(query):
     return response
 
 
-def opensanctions_import_in_progress():
+def read_opensanctions_import_status():
     try:
         status = json.loads(OPENSANCTIONS_STATUS_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
-    return isinstance(status, dict) and status.get("state") in {"running", "indexing"}
+        return {}
+    return status if isinstance(status, dict) else {}
+
+
+def opensanctions_average_rate(status):
+    global opensanctions_progress_run
+    if status.get("state") != "running":
+        with opensanctions_progress_lock:
+            opensanctions_progress_samples.clear()
+            opensanctions_progress_run = None
+        return None
+    version = status.get("version")
+    started_at = status.get("started_at")
+    try:
+        scanned = int(status.get("scanned", 0))
+        updated_at = datetime.fromisoformat(status["updated_at"].replace("Z", "+00:00"))
+        timestamp = updated_at.replace(tzinfo=timezone.utc).timestamp() if updated_at.tzinfo is None else updated_at.timestamp()
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+    run = (version, started_at)
+    with opensanctions_progress_lock:
+        if opensanctions_progress_run != run:
+            opensanctions_progress_samples.clear()
+            opensanctions_progress_run = run
+        if scanned > 0 and (not opensanctions_progress_samples or
+                            scanned > opensanctions_progress_samples[-1][1]):
+            opensanctions_progress_samples.append((timestamp, scanned))
+        samples = list(opensanctions_progress_samples)
+    if len(samples) < 2:
+        return None
+    elapsed = samples[-1][0] - samples[0][0]
+    scanned_delta = samples[-1][1] - samples[0][1]
+    if elapsed <= 0 or scanned_delta <= 0:
+        return None
+    return scanned_delta / elapsed
+
+
+def get_opensanctions_import_status():
+    status = read_opensanctions_import_status()
+    state = status.get("state", "not_started")
+    version = status.get("version")
+    try:
+        scanned = max(0, int(status.get("scanned", 0)))
+        imported = max(0, int(status.get("imported", 0)))
+        expected = int(status.get("expected_entities") or OPENSANCTIONS_ENTITY_COUNTS.get(version, 0))
+    except (TypeError, ValueError):
+        scanned, imported, expected = 0, 0, 0
+    progress = round(min(100, scanned * 100 / expected), 1) if expected > 0 else None
+    average_rate = opensanctions_average_rate(status)
+    eta_seconds = int((expected - scanned) / average_rate) if average_rate and expected > scanned else None
+    staging = None
+    if isinstance(version, str) and re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version):
+        staging = OPENSANCTIONS_DB.with_name(f".{OPENSANCTIONS_DB.name}.{version}.tmp")
+    published = state == "complete" and OPENSANCTIONS_DB.is_file()
+    return {
+        "state": state,
+        "version": version,
+        "scanned": scanned,
+        "imported": imported,
+        "expected_entities": expected or None,
+        "progress_percent": progress,
+        "average_rate_per_second": round(average_rate, 1) if average_rate else None,
+        "eta_seconds": eta_seconds,
+        "started_at": status.get("started_at"),
+        "updated_at": status.get("updated_at"),
+        "source_updated_at": status.get("source_updated_at"),
+        "last_source_change": status.get("last_source_change", status.get("last_change")),
+        "invalid_lines": status.get("invalid_lines", 0),
+        "error": status.get("error"),
+        "published": published,
+        "can_publish": state == "ready_to_publish" and staging is not None and staging.is_file(),
+    }
+
+
+def opensanctions_import_in_progress():
+    return read_opensanctions_import_status().get("state") in {
+        "running", "indexing", "validating", "ready_to_publish",
+    }
 
 
 async def call_search_by_name(query):
@@ -339,6 +422,13 @@ async def call_search_by_name(query):
         except Exception as error:
             api_error = find_api_error(error)
             if api_error is not None and api_error.code == "search_data_unavailable":
+                import_status = read_opensanctions_import_status()
+                if import_status.get("state") == "ready_to_publish":
+                    raise APIError(
+                        503,
+                        "search_import_ready_to_publish",
+                        "Импорт завершён; опубликуйте базу в настройках, чтобы включить поиск.",
+                    ) from error
                 if opensanctions_import_in_progress():
                     raise APIError(
                         503,
@@ -498,6 +588,33 @@ async def update_wireguard_settings(body: WireGuardToggleRequest):
         status = 409 if code == "not_configured" else 503
         raise APIError(status, code, "Не удалось изменить состояние WireGuard.")
     return result
+
+
+@app.get("/api/settings/opensanctions")
+async def get_opensanctions_settings():
+    return get_opensanctions_import_status()
+
+
+@app.post("/api/settings/opensanctions/publish")
+async def publish_opensanctions_settings():
+    try:
+        result = await asyncio.to_thread(
+            opensanctions_import.publish_snapshot,
+            OPENSANCTIONS_DB,
+            OPENSANCTIONS_STATUS_PATH,
+        )
+    except opensanctions_import.ImportBusyError as error:
+        raise APIError(409, "import_busy", str(error)) from error
+    except opensanctions_import.ImportNotReadyError as error:
+        raise APIError(409, "import_not_ready", str(error)) from error
+    except opensanctions_import.InvalidImportDatabaseError as error:
+        logger.warning("OpenSanctions staging validation failed (%s)", type(error).__name__)
+        raise APIError(
+            422,
+            "invalid_import_database",
+            "Проверка staging-базы не пройдена; текущая база не изменена.",
+        ) from error
+    return {key: result.get(key) for key in ("state", "version", "imported", "scanned", "published_at")}
 
 
 @app.post("/api/check")

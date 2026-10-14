@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
-  <link rel="stylesheet" href="/static/style.css?v=7">
+  <link rel="stylesheet" href="/static/style.css?v=8">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=11"></script>
+  <script type="module" src="/static/app.js?v=12"></script>
 </head>
 <body>
   <header class="site-header">
@@ -95,6 +95,16 @@
       <label class="toggle-label" for="wireguard-enabled"><input id="wireguard-enabled" type="checkbox" disabled><span>Подключение активно</span></label>
       <p id="wireguard-status" class="wireguard-status" role="status" aria-live="polite">Проверяем состояние туннеля…</p>
       <div id="wireguard-message" class="form-message" role="status" aria-live="polite"></div>
+    </section>
+    <section class="opensanctions-settings" aria-labelledby="opensanctions-heading">
+      <h3 id="opensanctions-heading">OpenSanctions ru_egrul</h3>
+      <p id="opensanctions-status" class="opensanctions-status" role="status" aria-live="polite">Проверяем импорт…</p>
+      <progress id="opensanctions-progress" class="opensanctions-progress" max="100" value="0" aria-label="Прогресс импорта" hidden></progress>
+      <p id="opensanctions-progress-label" class="opensanctions-details"></p>
+      <p id="opensanctions-estimate" class="opensanctions-details"></p>
+      <p id="opensanctions-source" class="opensanctions-details"></p>
+      <button id="opensanctions-publish" class="button button-primary opensanctions-publish" type="button" hidden><i data-lucide="database" aria-hidden="true"></i><span>Опубликовать базу</span></button>
+      <p id="opensanctions-message" class="opensanctions-message" role="status" aria-live="polite"></p>
     </section>
   </dialog>
   <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a> · <span class="footer-version">Версия 1.2</span></p></div></footer>

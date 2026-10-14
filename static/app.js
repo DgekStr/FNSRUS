@@ -501,6 +501,17 @@ let apiSettings = { configured: false, enabled: false };
 let settingsBusy = false;
 let wireguardState = { configured: false, enabled: false, active: false, handshake: false };
 let wireguardBusy = false;
+const opensanctionsStatus = document.getElementById("opensanctions-status");
+const opensanctionsProgress = document.getElementById("opensanctions-progress");
+const opensanctionsProgressLabel = document.getElementById("opensanctions-progress-label");
+const opensanctionsEstimate = document.getElementById("opensanctions-estimate");
+const opensanctionsSource = document.getElementById("opensanctions-source");
+const opensanctionsPublish = document.getElementById("opensanctions-publish");
+const opensanctionsMessage = document.getElementById("opensanctions-message");
+let opensanctionsTimer = null;
+let opensanctionsPollBusy = false;
+let opensanctionsPublishing = false;
+let opensanctionsCurrent = null;
 
 function showSettings(data) {
   apiSettings = data;
@@ -595,6 +606,114 @@ wireguardToggle.addEventListener("change", async () => {
   }
 });
 
+async function opensanctionsRequest(publish = false) {
+  const response = await fetch(publish ? "/api/settings/opensanctions/publish" : "/api/settings/opensanctions", {
+    method: publish ? "POST" : "GET",
+    headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
+    body: publish ? "{}" : undefined,
+    cache: "no-store",
+    signal: AbortSignal.timeout(publish ? 180000 : 15000),
+  });
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error("Сервер вернул некорректный ответ импорта."); }
+  if (!response.ok) {
+    const error = new Error(data.message || "Не удалось проверить импорт.");
+    error.code = data.error;
+    throw error;
+  }
+  return data;
+}
+
+function formatImportCount(value) {
+  return new Intl.NumberFormat("ru-RU").format(value);
+}
+
+function formatImportDuration(seconds) {
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return hours ? `${hours} ч ${String(remainingMinutes).padStart(2, "0")} мин` : `${remainingMinutes} мин`;
+}
+
+function renderOpenSanctionsStatus(data) {
+  opensanctionsCurrent = data;
+  const labels = {
+    not_started: "Импорт ещё не запускался.",
+    running: "Импорт выполняется.",
+    indexing: "Сканирование завершено; строится поисковый индекс.",
+    validating: "Проверяется целостность базы.",
+    ready_to_publish: "Импорт завершён; проверенная база готова к публикации.",
+    complete: data.published ? "База импортирована и опубликована." : "Импорт завершён.",
+    failed: "Импорт завершился с ошибкой.",
+  };
+  opensanctionsStatus.textContent = labels[data.state] || "Статус импорта неизвестен.";
+  opensanctionsStatus.classList.toggle("error", data.state === "failed");
+
+  const total = Number(data.expected_entities);
+  const scanned = Number(data.scanned) || 0;
+  const imported = Number(data.imported) || 0;
+  const hasProgress = Number.isFinite(total) && total > 0;
+  opensanctionsProgress.hidden = !hasProgress;
+  opensanctionsProgressLabel.textContent = hasProgress
+    ? `${formatImportCount(scanned)} из ${formatImportCount(total)} строк · ${data.progress_percent ?? 0}% · добавлено компаний: ${formatImportCount(imported)}`
+    : "";
+  if (hasProgress) opensanctionsProgress.value = Math.min(100, Number(data.progress_percent) || 0);
+
+  if (data.state === "running" && data.average_rate_per_second && data.eta_seconds !== null) {
+    const completion = new Date(Date.now() + data.eta_seconds * 1000);
+    const completionText = new Intl.DateTimeFormat("ru-RU", {
+      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    }).format(completion);
+    opensanctionsEstimate.textContent = `Средняя скорость ${formatImportCount(Math.round(data.average_rate_per_second))} строк/с · ориентир сканирования: ${completionText} (около ${formatImportDuration(data.eta_seconds)}).`;
+  } else if (data.state === "running") {
+    opensanctionsEstimate.textContent = "Средняя оценка появится после двух контрольных обновлений прогресса.";
+  } else if (["indexing", "validating"].includes(data.state)) {
+    opensanctionsEstimate.textContent = "Загрузка завершена; выполняются индексация и итоговая проверка.";
+  } else {
+    opensanctionsEstimate.textContent = "";
+  }
+
+  const sourceDates = [
+    data.version ? `Снимок ${data.version}` : "",
+    data.source_updated_at ? `обновлён ${String(data.source_updated_at).slice(0, 10)}` : "",
+    data.last_source_change ? `источник менялся ${String(data.last_source_change).slice(0, 10)}` : "",
+  ].filter(Boolean);
+  opensanctionsSource.textContent = sourceDates.join(" · ");
+  opensanctionsPublish.hidden = !data.can_publish;
+  opensanctionsPublish.disabled = opensanctionsPublishing || !data.can_publish;
+  if (data.state === "failed" && data.error) setOpenSanctionsMessage(data.error, true);
+}
+
+function setOpenSanctionsMessage(text, isError = false) {
+  opensanctionsMessage.textContent = text;
+  opensanctionsMessage.classList.toggle("error", isError);
+}
+
+function scheduleOpenSanctionsRefresh(delay) {
+  clearTimeout(opensanctionsTimer);
+  if (settingsDialog.open) opensanctionsTimer = setTimeout(() => void refreshOpenSanctionsStatus(), delay);
+}
+
+async function refreshOpenSanctionsStatus() {
+  if (!settingsDialog.open || opensanctionsPollBusy) return;
+  opensanctionsPollBusy = true;
+  try {
+    const data = await opensanctionsRequest();
+    renderOpenSanctionsStatus(data);
+    if (data.state !== "failed" && !opensanctionsPublishing) setOpenSanctionsMessage("");
+  } catch (error) {
+    opensanctionsStatus.textContent = "Статус импорта временно недоступен.";
+    setOpenSanctionsMessage(error.message, true);
+  } finally {
+    opensanctionsPollBusy = false;
+    const state = opensanctionsCurrent?.state;
+    if (!state || ["running", "indexing", "validating"].includes(state)) {
+      scheduleOpenSanctionsRefresh(state ? 15000 : 30000);
+    }
+  }
+}
+
 function settingsFeedback(text, isError = false) {
   settingsMessage.textContent = text;
   settingsMessage.classList.toggle("error", isError);
@@ -628,6 +747,7 @@ document.getElementById("settings-open").addEventListener("click", async () => {
     showSettings(await settingsRequest());
     settingsDialog.showModal();
     void refreshWireguardSettings();
+    void refreshOpenSanctionsStatus();
   } catch (error) {
     if (error.code === "local_network_only") {
       settingsAccessDialog.showModal();
@@ -635,10 +755,14 @@ document.getElementById("settings-open").addEventListener("click", async () => {
     }
     settingsDialog.showModal();
     settingsFeedback(error.message, true);
+    void refreshOpenSanctionsStatus();
   }
 });
 document.getElementById("settings-close").addEventListener("click", () => settingsDialog.close());
-settingsDialog.addEventListener("close", () => { apiKeyInput.value = ""; });
+settingsDialog.addEventListener("close", () => {
+  apiKeyInput.value = "";
+  clearTimeout(opensanctionsTimer);
+});
 document.getElementById("settings-access-denied-close").addEventListener("click", () => settingsAccessDialog.close());
 settingsForm.addEventListener("submit", event => {
   event.preventDefault();
@@ -650,6 +774,24 @@ settingsForm.addEventListener("submit", event => {
 document.getElementById("settings-test").addEventListener("click", () => settingsAction(() => settingsRequest("POST", undefined, "/test"), "Доступ к API-ФНС подтверждён."));
 document.getElementById("settings-delete").addEventListener("click", () => {
   if (confirm("Удалить сохранённый API-ключ?")) settingsAction(() => settingsRequest("DELETE"), "Ключ удалён. Используются открытые источники.");
+});
+opensanctionsPublish.addEventListener("click", async () => {
+  if (opensanctionsPublishing || !opensanctionsCurrent?.can_publish) return;
+  if (!confirm("Опубликовать проверенную базу OpenSanctions и заменить текущую базу поиска?")) return;
+  opensanctionsPublishing = true;
+  opensanctionsPublish.disabled = true;
+  setOpenSanctionsMessage("Публикуем проверенную базу…");
+  try {
+    await opensanctionsRequest(true);
+    await refreshOpenSanctionsStatus();
+    setOpenSanctionsMessage("База опубликована; поиск доступен.");
+  } catch (error) {
+    setOpenSanctionsMessage(error.message, true);
+    await refreshOpenSanctionsStatus();
+  } finally {
+    opensanctionsPublishing = false;
+    opensanctionsPublish.disabled = !opensanctionsCurrent?.can_publish;
+  }
 });
 settingsRequest().then(showSettings).catch(() => {});
 window.addEventListener("load", refreshIcons, { once: true });
