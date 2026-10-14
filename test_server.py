@@ -586,6 +586,23 @@ class APITests(unittest.TestCase):
         self.assertEqual(response.json()["message"], "Поиск по названию временно недоступен, введите ИНН")
         self.assertEqual(self.client.post("/api/search", json={"query": "я"}).status_code, 422)
 
+    def test_search_reports_active_opensanctions_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = Path(directory) / "import-status.json"
+            status_path.write_text(json.dumps({"state": "running", "scanned": 100000}), encoding="utf-8")
+
+            async def empty_database(arguments):
+                raise server.APIError(503, "search_data_unavailable", server.SEARCH_DATA_UNAVAILABLE_MESSAGE)
+
+            with patch.object(server, "OPENSANCTIONS_STATUS_PATH", status_path), patch.object(
+                server, "invoke_egrul_search", empty_database
+            ):
+                response = self.client.post("/api/search", json={"query": "сбер"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"], "search_import_in_progress")
+        self.assertIn("загрузка базы OpenSanctions", response.json()["message"])
+
     def test_seven_tools_allowed(self):
         async def fake_call(name, arguments):
             return {"tool": name, "arguments": arguments}

@@ -35,6 +35,7 @@ SEARCH_UNAVAILABLE_MESSAGE = "Поиск по названию временно 
 SEARCH_DATA_UNAVAILABLE_MESSAGE = "База ЕГРЮЛ не загружена. Импортируйте официальный набор данных ФНС."
 WIREGUARD_CONTROL_SOCKET = Path(os.environ.get("FNS_WG_CONTROL_SOCKET", "/run/fnsrus-wg-control.sock"))
 OPENSANCTIONS_DB = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
+OPENSANCTIONS_STATUS_PATH = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
 TOOL_NAMES = frozenset({
     "check_contractor", "check_inn", "check_ogrn", "get_legal_status",
     "get_okveds", "get_directors_history", "check_for_red_flags",
@@ -305,6 +306,14 @@ def search_opensanctions_database(query):
     return response
 
 
+def opensanctions_import_in_progress():
+    try:
+        status = json.loads(OPENSANCTIONS_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(status, dict) and status.get("state") in {"running", "indexing"}
+
+
 async def call_search_by_name(query):
     if call_lock.locked():
         raise APIError(409, "busy", "Уже выполняется проверка. Дождитесь её завершения.")
@@ -330,6 +339,12 @@ async def call_search_by_name(query):
         except Exception as error:
             api_error = find_api_error(error)
             if api_error is not None and api_error.code == "search_data_unavailable":
+                if opensanctions_import_in_progress():
+                    raise APIError(
+                        503,
+                        "search_import_in_progress",
+                        "Идёт загрузка базы OpenSanctions. Поиск станет доступен после завершения импорта.",
+                    ) from error
                 raise api_error from error
             if api_error is not None and api_error.status == 429:
                 raise api_error from error
