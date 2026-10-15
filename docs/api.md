@@ -66,7 +66,10 @@
 выделить — показывается начало адреса (до 30 символов) или `—`.
 Для OpenSanctions-источника ответ также включает `source`, `dataset`,
 `snapshot_date`, `last_source_change` и `license`; UI показывает эти сведения
-и ссылку на источник.
+и ссылку на источник. Во время live sync ответ дополнительно содержит
+`partial_sync: true`, `sync_version` и `synced_companies`. Поиск доступен по
+уже закоммиченным batches, но отсутствие компании в частичном снимке не является
+окончательным.
 
 ```json
 {
@@ -133,13 +136,16 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 | 502 | Подпроцесс завершился с ошибкой / некорректный ответ |
 | 503 | Обязательный источник недоступен или база ЕГРЮЛ не загружена |
 | 504 | Таймаут вызова MCP, 50 секунд |
+| 507 | Для полного архива и резерва PostgreSQL недостаточно свободного места |
 
 Поиск отвечает HTTP 503 с сообщением «Поиск по названию временно недоступен,
 введите ИНН» при сбое MCP-сервера. Пока OpenSanctions импортирует снимок,
 возвращается код `search_import_in_progress`; если обе базы пусты — отдельная
 ошибка готовности. Ни одно из этих состояний не означает, что компания отсутствует.
-После завершения импорта до ручной публикации поиск возвращает HTTP 503 с кодом
-`search_import_ready_to_publish`.
+Во время live sync поиск использует уже закоммиченные batches и возвращает
+`partial_sync: true`; отсутствие совпадения до завершения полного snapshot не
+считается окончательным. Если индекс ещё не создан, поиск возвращает HTTP 503
+`search_import_in_progress`.
 
 Частичный агрегированный отчёт может иметь HTTP 200, но
 `verdict_action: manual_review_required`. Ошибка необязательного источника
@@ -152,6 +158,9 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 
 ## Настройки API-ФНС
 
+- `GET /api/settings/wireguard`: статус конфигурации, активного соединения, handshake и systemd autostart.
+- `POST /api/settings/wireguard/action`: `{"action":"save","enabled":true|false}` сохраняет только автозапуск; `{"action":"enable"}` запускает WG сейчас, `{"action":"disable"}` останавливает WG сейчас. Runtime-действия не меняют autostart.
+- `POST /api/settings/wireguard`: legacy-команда; `enabled:true/false` одновременно меняет autostart и состояние соединения.
 - `GET /api/settings/api-fns`: только `configured`, `enabled`, `verified_at`, `methods`;
   ключ или его часть никогда не возвращается.
 - `POST /api/settings/api-fns`: `{"api_key":"<новый ключ>","enabled":true}`;
@@ -161,7 +170,34 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 - `GET /api/settings/opensanctions`: LAN-only статус импорта, прогресс, средний темп и ETA.
 - `GET /api/settings/opensanctions/update-check`: сравнить published version с upstream `index.json`.
 - `POST /api/settings/opensanctions/import`: запустить импорт строго указанного `expected_version`.
-- `POST /api/settings/opensanctions/publish`: опубликовать готовую staging-базу. Требует `{}` и `X-FNS-Settings: 1`.
+- `POST /api/settings/opensanctions/stop`: остановить только активный unit с указанным `expected_version`.
+- `GET /api/settings/opensanctions/archive`: статус архива, каталог, свободное место и готовность PostgreSQL.
+- `GET /api/settings/opensanctions/archive/preflight?expected_version=<версия>`: размер, требуемое место, Range-режим и право старта.
+- `POST /api/settings/opensanctions/archive/start`: запустить скачивание и PostgreSQL-импорт указанной версии.
+- `POST /api/settings/opensanctions/archive/stop`: остановить только archive unit указанной версии.
+- `POST /api/settings/opensanctions/publish`: legacy endpoint для готовой staging-базы. Новые импорты пишутся в live-БД сразу.
+
+### Полный архив и PostgreSQL
+
+Архив сохраняется в каталог `FNS_OPENSANCTIONS_ARCHIVE_DIR` (по умолчанию
+`/var/lib/mcp-fns/archives/opensanctions`). Preflight повторно сверяет upstream
+версию, проверяет свободное место и соединение/права PostgreSQL. Кнопка старта
+доступна только при достаточном запасе места и отсутствии другого активного
+импорта; сервер повторяет все проверки непосредственно перед systemd start.
+
+Параллельная загрузка включается только после точной проверки HTTP 206 и
+`Content-Range`; используется до 8 потоков с сегментами по 64 MiB и manifest для
+восстановления. Если CDN игнорирует Range или меняет ответ, задача очищает только
+несовместимые временные файлы и переходит на один поток. UI явно показывает режим.
+Архив проверяется по SHA-1 и размеру; перед импортом в PostgreSQL повторно
+сверяются checksum и число строк. Старые строки удаляются только после успешной
+проверки полного snapshot. Статус можно остановить; завершённые Range-сегменты
+сохраняются, последовательный режим после обрыва начинает текущую попытку заново.
+
+Успешный start возвращает HTTP 202: скачивание и перенос выполняются отдельным
+version-scoped systemd unit, не внутри HTTP-запроса. HTTP 409 означает активный
+импорт или изменившийся snapshot, HTTP 503 — PostgreSQL/control недоступен,
+HTTP 507 — недостаточно свободного места.
 
 Импорт запускается только после сверки версий. Запрос
 `POST /api/settings/opensanctions/import` принимает
@@ -171,13 +207,23 @@ upstream index и отклоняет устаревший `expected_version` с 
 импорта и shared file lock блокируют повторный запуск; успешный ответ HTTP 202
 означает, что version-scoped unit принят systemd.
 
-Статус OpenSanctions обновляется контрольными точками импорта. Средняя скорость и
-ETA рассчитываются по нескольким последним обновлениям; до накопления данных ETA
-не показывается. Состояние `ready_to_publish` означает, что поток проверен по
-размеру, SHA-1 и числу записей, FTS5 построен, а staging-БД прошла integrity check.
-Кнопка публикации в настройках дополнительно проверяет metadata и SQLite quick check,
-после чего атомарно заменяет активную базу. До готовности endpoint отвечает HTTP 409;
-при ошибке проверки HTTP 422, активная база при этом не заменяется.
+Остановка также требует `{"expected_version":"<активная версия>"}`. HTTP 202
+означает, что systemd принял non-blocking stop; status становится `stopping`, а
+после выхода unit — `interrupted`. Committed batches и версия для resume сохраняются.
+Повторный start во время active/retrying unit отвечает HTTP 409.
+
+Статус OpenSanctions обновляется каждые 100 000 FTM записей. SQLite работает в
+WAL-режиме; валидированные компании записываются UPSERT batches по 100 000, а FTS5
+обновляется триггерами во время загрузки. `synced_companies` считает строки,
+уже помеченные текущей версией snapshot. На сетевых ошибках HTTP stream выполняет
+до 8 попыток с backoff 15, 30, 60, 120, 300, 600 и 900 секунд. Curl закреплён на
+HTTP/1.1 и завершает длительное зависание после 120 секунд ниже 1 КБ/с. Источник
+не поддерживает byte-range (range GET возвращает HTTP 200), поэтому повторное
+соединение читает файл с начала; UPSERT по `INN` и `last_seen_version` пропускает
+уже синхронизированные строки. Успешная сверка размера, SHA-1, entity count,
+malformed lines и integrity check предшествует удалению устаревших компаний и
+переключению published version. Ошибка оставляет live-БД и sync marker для resume.
+ETA рассчитывается по нескольким последним status checkpoints.
 
 В `api_key` можно передать сам ключ (8-256 символов) или регистрационную ссылку
 `http://api-fns.ru/api/stat?key=<ключ>` / HTTPS-вариант (до 1024 символов).

@@ -66,14 +66,16 @@ runuser -u deploy -- env \
 Датасет публикуется как line-delimited `entities.ftm.json`; импортёр оставляет
 записи `Company` с валидным ИНН и строит отдельный индекс
 `/var/lib/mcp-fns/opensanctions.sqlite`. Исходный 31-ГБ JSON на сервере не
-сохраняется; загрузка идёт через ограниченный WireGuard SOCKS proxy.
+сохраняется потоковым импортом; загрузка идёт через ограниченный WireGuard SOCKS proxy.
 
 Сначала откройте «Настройки API» из LAN и включите WireGuard. В разделе
 OpenSanctions нажмите «Сверить версии». Импорт доступен только если upstream
 snapshot новее опубликованной базы или база ещё не опубликована. Кнопка запуска
 повторно сверяет version перед systemd start; если источник успел обновиться,
-сервер попросит выполнить проверку ещё раз. Пока unit работает или staging ждёт
-публикации, новый запуск заблокирован.
+сервер попросит выполнить проверку ещё раз. Пока unit работает, новый запуск
+заблокирован. Кнопка «Остановить импорт» посылает graceful SIGTERM только активному
+version-scoped unit; до 180 секунд даётся на flush текущего batch, затем status
+переходит через `stopping` в `interrupted`; повторный запуск доступен после выхода unit.
 
 Для ручного запуска из CLI передавайте версию, которую только что проверили:
 
@@ -82,22 +84,82 @@ cd /srv/mcp-fns
 runuser -u deploy -- .venv/bin/python scripts/import_opensanctions.py --expected-version 20260912190833-iof
 ```
 
-Импорт проверяет свободное место, версию/URL metadata index, размер, SHA-1,
-число записей и отсутствие некорректных строк. После FTS5-индексации и SQLite
-integrity check staging сохраняется со статусом `ready_to_publish`; активная база
-не заменяется автоматически. Статус и версия снимка записываются в
-`/var/lib/mcp-fns/opensanctions-import-status.json`. В начале загрузки скрипт
-требует не менее 4 ГБ свободного места.
+Импорт проверяет свободное место и закреплённую версию index. SQLite работает
+в WAL-режиме: после каждых 100 000 компаний (и на status checkpoints) batch
+коммитится в живую БД; FTS5 обновляется триггерами и остаётся доступен поиску
+во время загрузки. ИНН служит ключом UPSERT, а `last_seen_version` помечает уже
+синхронизированные записи. Если соединение оборвалось, committed batches
+сохраняются; повторный запуск с той же версией безопасно перечитывает stream,
+не создавая дублей. Curl принудительно использует HTTP/1.1, connect timeout 30 с
+и speed timeout 120 с при скорости ниже 1 КБ/с. На transport/length/checksum ошибке
+выполняется до 8 повторов с backoff 15/30/60/120/300/600/900 секунд. Источник не
+поддерживает Range (ranged GET возвращает HTTP 200), поэтому retry перечитывает
+файл с начала; durable version marker делает повторный UPSERT идемпотентным. При
+обрыве до конца текущая база помечается partial, и поиск показывает предупреждение.
 
-Проверить прогресс и среднюю оценку завершения можно в разделе OpenSanctions
-настроек из LAN. После `ready_to_publish` нажмите «Опубликовать базу»; сервер
-проверит staging metadata/SQLite и атомарно переключит активный индекс. При ошибке
-проверки текущая база не изменяется.
+Старые записи удаляются и published `version` переключается только после
+полного совпадения размера, SHA-1 и количества JSONL записей, проверки отсутствия
+malformed lines и SQLite integrity check. До этого предыдущая версия остаётся в
+таблице, а обновлённые/новые компании уже доступны. Status и версия записываются
+в `/var/lib/mcp-fns/opensanctions-import-status.json`. В начале загрузки требуется
+не менее 4 ГБ свободного места.
+
+Проверить прогресс, число уже синхронизированных компаний и среднюю оценку
+завершения можно в разделе OpenSanctions настроек из LAN. Поиск во время загрузки
+помечает результаты как partial; отсутствие совпадения в этот период не является
+окончательным. После ошибки повторно сверьте актуальную версию и запустите импорт:
+автоматические retries или ручной resume догрузят/обновят строки, а cleanup старых
+записей выполнится только после успешной итоговой проверки.
 
 OpenSanctions публикует bulk-данные под CC BY-NC 4.0: этот источник разрешён
 только для некоммерческого использования. Бизнес/compliance screening требует
 коммерческой лицензии даже при бесплатном доступе. `ru_egrul` обновляется
 ежемесячно/неавтоматически; фактические даты снимка отображаются в результатах.
+
+#### Полный архив и PostgreSQL
+
+Полный архив сохраняется в `FNS_OPENSANCTIONS_ARCHIVE_DIR` (по умолчанию
+`/var/lib/mcp-fns/archives/opensanctions`) и после проверки импортируется в локальную
+PostgreSQL-БД `fnsrus`. DSN использует peer authentication для системного пользователя
+`deploy`. Установите сервер и подготовьте роль/БД:
+
+```bash
+apt-get update
+apt-get install -y postgresql
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 <<'SQL'
+DO $body$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'deploy') THEN
+    CREATE ROLE deploy LOGIN;
+  END IF;
+END
+$body$;
+SQL
+runuser -u postgres -- createdb --if-not-exists --owner=deploy fnsrus
+install -d -o deploy -g www-data -m 0750 /var/lib/mcp-fns/archives/opensanctions
+runuser -u deploy -- psql 'dbname=fnsrus user=deploy host=/var/run/postgresql' -c 'SELECT 1'
+```
+
+`requirements.txt` закрепляет `psycopg[binary]`. Preflight считает по свежему
+`index.json`: оставшийся размер архива плюс 4 GiB свободного резерва и 4 GiB
+резерва PostgreSQL. Не обходите отказ preflight при недостатке места.
+
+Шаблон архивной задачи устанавливается отдельно:
+
+```bash
+install -m 0644 systemd/fnsrus-opensanctions-archive@.service /etc/systemd/system/fnsrus-opensanctions-archive@.service
+systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
+systemctl daemon-reload
+```
+
+В LAN откройте «Настройки API», сверьте версии, выполните проверку места и
+нажмите «Скачать полный архив». Задача выполняется асинхронно в version-scoped
+unit; PostgreSQL bulk import начинается только после полной проверки размера,
+SHA-1 и количества строк. Активный SQLite-import и archive job взаимоисключаются.
+Параллельная загрузка использует до 8 потоков только при подтверждённом Range
+(HTTP 206 с точным `Content-Range`); если CDN его игнорирует, UI сообщает о переходе
+на один поток. Повторное скачивание после остановки в single-stream режиме начнётся
+с начала; проверенные параллельные сегменты сохраняются в manifest.
 
 ## 3. Файлы и зависимости
 
@@ -125,7 +187,7 @@ find templates static scripts systemd nginx docs -type d -exec chmod 0750 {} +
 find templates static scripts systemd nginx docs -type f -exec chmod 0640 {} +
 runuser -u deploy -- /home/deploy/.local/bin/uv venv .venv --python /usr/bin/python3
 runuser -u deploy -- /home/deploy/.local/bin/uv pip install --python .venv/bin/python -r requirements.txt
-runuser -u deploy -- .venv/bin/python -m py_compile server.py api_fns.py scripts/import_opensanctions.py scripts/fnsrus_import_control.py
+runuser -u deploy -- .venv/bin/python -m py_compile server.py api_fns.py scripts/import_opensanctions.py scripts/fnsrus_import_control.py scripts/download_opensanctions_archive.py scripts/import_opensanctions_postgres.py
 runuser -u deploy -- .venv/bin/python -m unittest test_server -v
 ```
 
@@ -137,9 +199,10 @@ Nginx работает от www-data и читает статику по пра�
 
 ```bash
 cd /srv/mcp-fns
-systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
+systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
 install -m 0644 systemd/mcp-fns-ui.service /etc/systemd/system/mcp-fns-ui.service
 install -m 0644 systemd/fnsrus-opensanctions-import@.service /etc/systemd/system/fnsrus-opensanctions-import@.service
+install -m 0644 systemd/fnsrus-opensanctions-archive@.service /etc/systemd/system/fnsrus-opensanctions-archive@.service
 install -m 0644 systemd/fnsrus-import-control.socket /etc/systemd/system/fnsrus-import-control.socket
 install -m 0644 systemd/fnsrus-import-control@.service /etc/systemd/system/fnsrus-import-control@.service
 install -D -o root -g root -m 0755 scripts/fnsrus_import_control.py /usr/local/libexec/fnsrus-import-control

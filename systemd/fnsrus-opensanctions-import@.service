@@ -14,7 +14,7 @@ Environment=FNS_OPENSANCTIONS_STATUS=/var/lib/mcp-fns/opensanctions-import-statu
 ExecStart=/srv/mcp-fns/.venv/bin/python /srv/mcp-fns/scripts/import_opensanctions.py --expected-version %i
 TimeoutStartSec=30
 RuntimeMaxSec=infinity
-TimeoutStopSec=30
+TimeoutStopSec=180
 UMask=0027
 MemoryMax=512M
 CPUQuota=80%

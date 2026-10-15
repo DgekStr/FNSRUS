@@ -297,12 +297,14 @@ function renderSearchResults(data, query) {
   const results = data.results;
   searchResultsRows.replaceChildren();
   document.getElementById("search-result-count").textContent = results.length ? `Найдено совпадений: ${results.length}` : "";
-  searchEmptyMessage.textContent = results.length ? "" : `По запросу «${query}» ничего не найдено`;
+  searchEmptyMessage.textContent = results.length ? "" : data.partial_sync
+    ? `База ещё синхронизируется. По запросу «${query}» пока нет совпадений.`
+    : `По запросу «${query}» ничего не найдено`;
   searchEmptyMessage.classList.toggle("visible", results.length === 0);
   document.getElementById("search-limit-note").hidden = !data.truncated;
     const attribution = document.getElementById("search-attribution");
     attribution.replaceChildren();
-    const openSanctions = data.source === "OpenSanctions" || data.dataset === "ru_egrul";
+    const openSanctions = data.source === "OpenSanctions" || data.dataset === "ru_egrul" || data.partial_sync;
     attribution.hidden = !openSanctions;
     if (openSanctions) {
       const sourceLink = element("a", "", "OpenSanctions ru_egrul");
@@ -319,6 +321,12 @@ function renderSearchResults(data, query) {
       if (data.last_source_change) dates.push(`источник изменён ${data.last_source_change}`);
       if (dates.length) attribution.append(document.createTextNode(`${dates.join("; ")}. `));
       attribution.append("Лицензия: ", licenseLink, document.createTextNode(". Только для некоммерческого использования."));
+      if (data.partial_sync) {
+        attribution.append(
+          document.createTextNode(" "),
+          element("strong", "partial-sync-warning", "База синхронизируется: результаты неполные, отсутствие компании не является окончательным."),
+        );
+      }
     }
   for (const result of results) {
     const row = element("tr");
@@ -489,7 +497,10 @@ document.getElementById("copy-all").addEventListener("click", event => {
 });
 
 const settingsDialog = document.getElementById("api-settings");
-const wireguardToggle = document.getElementById("wireguard-enabled");
+const wireguardAutostart = document.getElementById("wireguard-autostart");
+const wireguardSave = document.getElementById("wireguard-save");
+const wireguardEnable = document.getElementById("wireguard-enable");
+const wireguardDisable = document.getElementById("wireguard-disable");
 const wireguardStatus = document.getElementById("wireguard-status");
 const wireguardMessage = document.getElementById("wireguard-message");
 const settingsAccessDialog = document.getElementById("settings-access-denied");
@@ -510,15 +521,33 @@ const opensanctionsPublish = document.getElementById("opensanctions-publish");
 const opensanctionsMessage = document.getElementById("opensanctions-message");
 const opensanctionsCheck = document.getElementById("opensanctions-check");
 const opensanctionsStart = document.getElementById("opensanctions-start");
+const opensanctionsStop = document.getElementById("opensanctions-stop");
 const opensanctionsStartLabel = document.getElementById("opensanctions-start-label");
 const opensanctionsUpdateStatus = document.getElementById("opensanctions-update-status");
+const archiveStatus = document.getElementById("archive-status");
+const archiveTarget = document.getElementById("archive-target");
+const archiveStorage = document.getElementById("archive-storage");
+const archivePostgres = document.getElementById("archive-postgres");
+const archiveProgress = document.getElementById("archive-progress");
+const archiveProgressLabel = document.getElementById("archive-progress-label");
+const archivePreflight = document.getElementById("archive-preflight");
+const archiveStart = document.getElementById("archive-start");
+const archiveStop = document.getElementById("archive-stop");
+const archivePreflightStatus = document.getElementById("archive-preflight-status");
+const archiveMessage = document.getElementById("archive-message");
 let opensanctionsTimer = null;
 let opensanctionsPollBusy = false;
 let opensanctionsPublishing = false;
 let opensanctionsChecking = false;
 let opensanctionsStarting = false;
+let opensanctionsStopping = false;
 let opensanctionsCurrent = null;
 let opensanctionsUpdate = null;
+let archiveCurrent = null;
+let archivePlan = null;
+let archivePreflighting = false;
+let archiveStarting = false;
+let archiveStopping = false;
 
 function showSettings(data) {
   apiSettings = data;
@@ -549,11 +578,11 @@ async function settingsRequest(method = "GET", body, suffix = "") {
   return data;
 }
 
-async function wireguardRequest(method = "GET", enabled) {
-  const response = await fetch("/api/settings/wireguard", {
+async function wireguardRequest(method = "GET", body, suffix = "") {
+  const response = await fetch(`/api/settings/wireguard${suffix}`, {
     method,
     headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
-    body: enabled === undefined ? undefined : JSON.stringify({ enabled }),
+    body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
     signal: AbortSignal.timeout(45000),
   });
@@ -566,17 +595,29 @@ async function wireguardRequest(method = "GET", enabled) {
 
 function showWireguardSettings(data) {
   wireguardState = data;
-  wireguardToggle.checked = Boolean(data.active);
-  wireguardToggle.disabled = wireguardBusy || !data.configured;
+  wireguardAutostart.checked = Boolean(data.enabled);
   if (!data.configured) wireguardStatus.textContent = "Конфигурация WireGuard не установлена.";
-  else if (data.active && data.handshake) wireguardStatus.textContent = `Туннель подключён · proxy ${data.proxy}`;
-  else if (data.active) wireguardStatus.textContent = "Интерфейс включён, ожидается handshake.";
-  else wireguardStatus.textContent = "Туннель выключен.";
+  else {
+    const connection = data.active
+      ? data.handshake ? `Подключён · proxy ${data.proxy}` : "Включён, ожидается handshake"
+      : "Выключен";
+    const autostart = data.enabled ? "автозапуск включён" : "автозапуск выключен";
+    wireguardStatus.textContent = `WireGuard ${connection}; ${autostart}.`;
+  }
+  updateWireguardControls();
+}
+
+function updateWireguardControls() {
+  const available = !wireguardBusy && Boolean(wireguardState.configured);
+  wireguardAutostart.disabled = !available;
+  wireguardSave.disabled = !available || wireguardAutostart.checked === Boolean(wireguardState.enabled);
+  wireguardEnable.disabled = !available || Boolean(wireguardState.active);
+  wireguardDisable.disabled = !available || !wireguardState.active;
 }
 
 async function refreshWireguardSettings() {
   wireguardBusy = true;
-  wireguardToggle.disabled = true;
+  updateWireguardControls();
   wireguardMessage.textContent = "Проверяем состояние туннеля…";
   wireguardMessage.classList.remove("error");
   try {
@@ -587,31 +628,39 @@ async function refreshWireguardSettings() {
     wireguardMessage.classList.add("error");
   } finally {
     wireguardBusy = false;
-    wireguardToggle.disabled = !wireguardState.configured;
+    updateWireguardControls();
   }
 }
 
-wireguardToggle.addEventListener("change", async () => {
-  const enabled = wireguardToggle.checked;
+async function applyWireguardAction(action, enabled) {
+  if (wireguardBusy || !wireguardState.configured) return;
   wireguardBusy = true;
-  wireguardToggle.disabled = true;
-  wireguardMessage.textContent = enabled ? "Подключаем WireGuard…" : "Отключаем WireGuard…";
+  updateWireguardControls();
+  wireguardMessage.textContent = action === "save" ? "Сохраняем автозапуск…"
+    : action === "enable" ? "Включаем WireGuard…" : "Выключаем WireGuard…";
   wireguardMessage.classList.remove("error");
   try {
-    const data = await wireguardRequest("POST", enabled);
+    const data = await wireguardRequest(
+      "POST", { action, ...(enabled === undefined ? {} : { enabled }) }, "/action",
+    );
     showWireguardSettings(data);
-    wireguardMessage.textContent = enabled && !data.handshake
-      ? "Интерфейс включён, ожидается handshake."
-      : "Состояние WireGuard обновлено.";
+    wireguardMessage.textContent = action === "save" ? "Автозапуск WireGuard сохранён."
+      : action === "enable" && !data.handshake ? "Интерфейс включён, ожидается handshake."
+        : action === "enable" ? "WireGuard включён."
+          : "WireGuard выключен.";
   } catch (error) {
-    wireguardToggle.checked = Boolean(wireguardState.active);
     wireguardMessage.textContent = error.message;
     wireguardMessage.classList.add("error");
   } finally {
     wireguardBusy = false;
-    wireguardToggle.disabled = !wireguardState.configured;
+    updateWireguardControls();
   }
-});
+}
+
+wireguardAutostart.addEventListener("change", updateWireguardControls);
+wireguardSave.addEventListener("click", () => void applyWireguardAction("save", wireguardAutostart.checked));
+wireguardEnable.addEventListener("click", () => void applyWireguardAction("enable"));
+wireguardDisable.addEventListener("click", () => void applyWireguardAction("disable"));
 
 async function opensanctionsRequest(endpoint = "", method = "GET", body) {
   const response = await fetch(`/api/settings/opensanctions${endpoint}`, {
@@ -619,7 +668,7 @@ async function opensanctionsRequest(endpoint = "", method = "GET", body) {
     headers: { "Content-Type": "application/json", "X-FNS-Settings": "1" },
     body: body === undefined ? undefined : JSON.stringify(body),
     cache: "no-store",
-    signal: AbortSignal.timeout(endpoint === "/publish" ? 180000 : endpoint === "/import" ? 60000 : endpoint ? 45000 : 15000),
+    signal: AbortSignal.timeout(endpoint === "/publish" ? 180000 : endpoint === "/stop" ? 210000 : endpoint ? 60000 : 15000),
   });
   let data;
   try { data = await response.json(); }
@@ -643,6 +692,16 @@ function formatImportDuration(seconds) {
   return hours ? `${hours} ч ${String(remainingMinutes).padStart(2, "0")} мин` : `${remainingMinutes} мин`;
 }
 
+function formatImportBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+  let scaled = bytes;
+  let unit = 0;
+  while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit++; }
+  return `${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: unit ? 1 : 0 }).format(scaled)} ${units[unit]}`;
+}
+
 function renderOpenSanctionsStatus(data) {
   opensanctionsCurrent = data;
   const labels = {
@@ -650,6 +709,9 @@ function renderOpenSanctionsStatus(data) {
     starting: "Запускается импорт OpenSanctions.",
     checking: "Сверяется версия снимка OpenSanctions.",
     running: "Импорт выполняется.",
+    retrying: "Связь прервалась; подготовлена повторная попытка.",
+    stopping: "Остановка: сохраняются уже синхронизированные batches.",
+    interrupted: "Импорт остановлен; синхронизированные компании сохранены.",
     indexing: "Сканирование завершено; строится поисковый индекс.",
     validating: "Проверяется целостность базы.",
     ready_to_publish: "Импорт завершён; проверенная база готова к публикации.",
@@ -662,10 +724,11 @@ function renderOpenSanctionsStatus(data) {
   const total = Number(data.expected_entities);
   const scanned = Number(data.scanned) || 0;
   const imported = Number(data.imported) || 0;
+  const synced = Number(data.synced_companies ?? imported) || 0;
   const hasProgress = Number.isFinite(total) && total > 0;
   opensanctionsProgress.hidden = !hasProgress;
   opensanctionsProgressLabel.textContent = hasProgress
-    ? `${formatImportCount(scanned)} из ${formatImportCount(total)} строк · ${data.progress_percent ?? 0}% · добавлено компаний: ${formatImportCount(imported)}`
+    ? `${formatImportCount(scanned)} из ${formatImportCount(total)} строк · ${data.progress_percent ?? 0}% · синхронизировано компаний: ${formatImportCount(synced)}`
     : "";
   if (hasProgress) opensanctionsProgress.value = Math.min(100, Number(data.progress_percent) || 0);
 
@@ -679,6 +742,14 @@ function renderOpenSanctionsStatus(data) {
     opensanctionsEstimate.textContent = "Средняя оценка появится после двух контрольных обновлений прогресса.";
   } else if (data.state === "checking") {
     opensanctionsEstimate.textContent = "Проверяем metadata index перед загрузкой.";
+  } else if (data.state === "retrying") {
+    const retryAt = Date.parse(data.retry_at || "");
+    const retryRemaining = Number.isFinite(retryAt)
+      ? Math.max(0, Math.ceil((retryAt - Date.now()) / 1000))
+      : Number(data.retry_in_seconds) || 1;
+    opensanctionsEstimate.textContent = `Повтор ${data.attempt} из ${data.max_attempts}; следующий старт через ${formatImportDuration(retryRemaining)}. Уже синхронизировано компаний: ${formatImportCount(synced)}.`;
+  } else if (data.state === "interrupted") {
+    opensanctionsEstimate.textContent = `Сохранено синхронизированных компаний: ${formatImportCount(synced)}. Проверьте версию и запустите resume.`;
   } else if (["indexing", "validating"].includes(data.state)) {
     opensanctionsEstimate.textContent = "Загрузка завершена; выполняются индексация и итоговая проверка.";
   } else {
@@ -693,19 +764,28 @@ function renderOpenSanctionsStatus(data) {
   opensanctionsSource.textContent = sourceDates.join(" · ");
   opensanctionsPublish.hidden = !data.can_publish;
   opensanctionsPublish.disabled = opensanctionsPublishing || !data.can_publish;
-  const importBusy = data.unit_active || ["starting", "checking", "running", "indexing", "validating", "ready_to_publish"].includes(data.state);
+  const importBusy = data.unit_active || ["starting", "checking", "running", "retrying", "stopping", "indexing", "validating", "ready_to_publish"].includes(data.state);
   const importControlUnavailable = data.import_control_available === false;
+  const canStop = Boolean(data.unit_active && data.version);
+  opensanctionsStop.hidden = !canStop;
+  opensanctionsStop.disabled = opensanctionsStopping || !canStop || data.state === "stopping";
   opensanctionsCheck.hidden = importBusy;
   opensanctionsCheck.disabled = importBusy || importControlUnavailable || opensanctionsChecking;
   if (importBusy) {
     opensanctionsUpdate = null;
     opensanctionsStart.hidden = true;
     opensanctionsStart.disabled = true;
-    if (["starting", "checking", "running", "indexing", "validating"].includes(data.state)) {
+    if (data.state === "retrying") {
+      opensanctionsUpdateStatus.textContent = `Связь восстанавливается; повтор ${data.attempt} из ${data.max_attempts}. Остановка сохранит уже синхронизированные данные.`;
+    } else if (data.state === "stopping") {
+      opensanctionsUpdateStatus.textContent = "Дождитесь сохранения текущей партии; новый запуск временно заблокирован.";
+    } else if (["starting", "checking", "running", "indexing", "validating"].includes(data.state)) {
       opensanctionsUpdateStatus.textContent = "Проверка версии и новый запуск недоступны, пока импорт выполняется.";
     } else if (data.state === "ready_to_publish") {
       opensanctionsUpdateStatus.textContent = "Сначала опубликуйте завершённую staging-базу.";
     }
+  } else if (data.state === "interrupted") {
+    opensanctionsUpdateStatus.textContent = `Импорт прерван. Сохранены ${formatImportCount(synced)} компаний; повторный запуск продолжит синхронизацию без дублей.`;
   } else if (importControlUnavailable) {
     opensanctionsStart.hidden = true;
     opensanctionsStart.disabled = true;
@@ -716,7 +796,9 @@ function renderOpenSanctionsStatus(data) {
     opensanctionsStart.disabled = opensanctionsStarting || !opensanctionsUpdate?.can_start;
     if (opensanctionsUpdate) renderOpenSanctionsUpdate(opensanctionsUpdate);
   }
-  if (data.state === "failed" && data.error) setOpenSanctionsMessage(data.error, true);
+  if (data.state === "retrying" && data.retry_error) setOpenSanctionsMessage(data.retry_error, true);
+  else if (data.state === "interrupted" && data.error) setOpenSanctionsMessage(data.error);
+  else if (data.state === "failed" && data.error) setOpenSanctionsMessage(data.error, true);
 }
 
 function renderOpenSanctionsUpdate(data) {
@@ -734,6 +816,102 @@ function renderOpenSanctionsUpdate(data) {
   opensanctionsStart.hidden = !canStart;
   opensanctionsStart.disabled = opensanctionsStarting || !canStart;
   opensanctionsStartLabel.textContent = data.decision === "initial_import" ? "Начать импорт" : "Импортировать обновление";
+  archivePreflight.disabled = archivePreflighting || !data.latest_version ||
+    Boolean(opensanctionsCurrent?.unit_active || archiveCurrent?.archive_active);
+}
+
+function setArchiveMessage(text, isError = false) {
+  archiveMessage.textContent = text;
+  archiveMessage.classList.toggle("error", isError);
+}
+
+function renderOpenSanctionsArchiveStatus(data) {
+  data = { state: "not_started", ...(data || {}) };
+  archiveCurrent = data;
+  const labels = {
+    not_started: "Полный архив ещё не загружался.",
+    checking: "Проверяем snapshot, PostgreSQL и свободное место.",
+    starting: "Запускаем загрузку полного архива.",
+    downloading: "Архив скачивается.",
+    retrying: "Связь прервалась; готовится повторная попытка.",
+    stopping: "Останавливаем задачу; завершённые сегменты сохранены.",
+    downloaded: "Архив загружен и проверен; готовится импорт PostgreSQL.",
+    postgres_importing: "Архив проверен; данные переносятся в PostgreSQL.",
+    validating: "Проверяются данные PostgreSQL перед публикацией.",
+    complete: "Архив импортирован в PostgreSQL.",
+    interrupted: "Задача прервана.",
+    failed: "Загрузка или импорт завершились ошибкой.",
+  };
+  archiveStatus.textContent = labels[data.state] || "Статус архива неизвестен.";
+  if (data.state === "interrupted") {
+    archiveStatus.textContent = data.download_mode === "parallel"
+      ? "Задача прервана; проверенные сегменты можно продолжить."
+      : data.download_mode === "single-stream"
+        ? "Задача прервана; повторная загрузка начнётся с начала."
+        : labels.interrupted;
+  }
+  archiveStatus.classList.toggle("error", data.state === "failed");
+  archiveTarget.textContent = `Каталог: ${data.archive_dir || "не настроен"}`;
+
+  const archiveSize = archivePlan?.archive_size_bytes ?? data.archive_size_bytes;
+  const available = Number(archivePlan?.available_bytes ?? data.available_bytes);
+  const required = Number(archivePlan?.required_free_bytes ?? data.required_free_bytes);
+  const storageParts = [];
+  if (archiveSize !== undefined) storageParts.push(`Архив: ${formatImportBytes(archiveSize)}`);
+  if (Number.isFinite(available)) storageParts.push(`свободно: ${formatImportBytes(available)}`);
+  if (Number.isFinite(required)) storageParts.push(`требуется: ${formatImportBytes(required)}`);
+  archiveStorage.textContent = storageParts.join(" · ");
+
+  const postgresErrors = {
+    not_configured: "не настроен",
+    driver_missing: "драйвер psycopg не установлен",
+    connection_failed: "сервер недоступен",
+    insufficient_privileges: "не хватает прав на создание таблиц",
+  };
+  archivePostgres.textContent = data.postgres_ready
+    ? "PostgreSQL доступен для импорта."
+    : `PostgreSQL ${postgresErrors[data.postgres_error] || "не готов к импорту"}.`;
+
+  const total = Number(data.total_bytes || data.archive_size_bytes);
+  const downloaded = Number(data.downloaded_bytes) || 0;
+  const postgresScanned = Number(data.postgres_scanned) || 0;
+  const expectedEntities = Number(data.expected_entities) || 0;
+  if (data.state === "postgres_importing" || data.state === "validating") {
+    archiveProgress.hidden = !expectedEntities;
+    archiveProgress.value = expectedEntities ? Math.min(100, postgresScanned * 100 / expectedEntities) : 0;
+    archiveProgressLabel.textContent = expectedEntities
+      ? `Импортировано строк: ${formatImportCount(postgresScanned)} из ${formatImportCount(expectedEntities)} · компаний: ${formatImportCount(data.postgres_synced_companies || 0)}`
+      : "Идёт импорт PostgreSQL.";
+  } else {
+    const hasDownloadProgress = total > 0 && ["starting", "checking", "downloading", "retrying", "stopping", "downloaded", "complete"].includes(data.state);
+    archiveProgress.hidden = !hasDownloadProgress;
+    archiveProgress.value = total && (data.state === "downloaded" || data.state === "complete")
+      ? 100 : total ? Math.min(100, downloaded * 100 / total) : 0;
+    archiveProgressLabel.textContent = hasDownloadProgress
+      ? `${formatImportBytes(downloaded)} из ${formatImportBytes(total)}`
+      : "";
+  }
+
+  if (archivePlan) {
+    const mode = archivePlan.download_mode === "parallel"
+      ? `Range поддерживается: ${archivePlan.parallel_workers || 8} потоков.`
+      : "CDN игнорирует Range: будет использован один поток.";
+    archivePreflightStatus.textContent = [
+      `Снимок ${archivePlan.version}.`,
+      mode,
+      !archivePlan.space_sufficient ? "Недостаточно свободного места." : "",
+      !archivePlan.postgres_ready ? `PostgreSQL: ${postgresErrors[archivePlan.postgres_error] || "не готов"}.` : "",
+    ].filter(Boolean).join(" ");
+  }
+
+  const active = Boolean(data.archive_active || data.import_active);
+  archivePreflight.disabled = archivePreflighting || !opensanctionsUpdate?.latest_version || active;
+  archiveStart.hidden = !archivePlan?.can_start;
+  archiveStart.disabled = archiveStarting || active || data.can_start === false || !archivePlan?.can_start;
+  archiveStop.hidden = !data.archive_active;
+  archiveStop.disabled = archiveStopping || !data.archive_active || data.state === "stopping";
+  if (data.state === "failed" && data.error) setArchiveMessage(data.error, true);
+  else if (data.state === "interrupted" && data.error) setArchiveMessage(data.error);
 }
 
 function setOpenSanctionsMessage(text, isError = false) {
@@ -756,11 +934,20 @@ async function refreshOpenSanctionsStatus() {
   } catch (error) {
     opensanctionsStatus.textContent = "Статус импорта временно недоступен.";
     setOpenSanctionsMessage(error.message, true);
+  }
+  try {
+    renderOpenSanctionsArchiveStatus(await opensanctionsRequest("/archive"));
+  } catch (error) {
+    archiveStatus.textContent = "Статус архива временно недоступен.";
+    setArchiveMessage(error.message, true);
   } finally {
     opensanctionsPollBusy = false;
     const state = opensanctionsCurrent?.state;
-    if (!state || ["starting", "checking", "running", "indexing", "validating"].includes(state)) {
-      scheduleOpenSanctionsRefresh(state ? 15000 : 30000);
+    const importActive = ["starting", "checking", "running", "retrying", "stopping", "indexing", "validating"].includes(state);
+    const archiveActive = archiveCurrent?.archive_active ||
+      ["starting", "checking", "downloading", "retrying", "stopping", "downloaded", "postgres_importing", "validating"].includes(archiveCurrent?.state);
+    if (settingsDialog.open) {
+      scheduleOpenSanctionsRefresh(importActive || archiveActive ? 15000 : 30000);
     }
   }
 }
@@ -771,7 +958,11 @@ async function checkOpenSanctionsUpdate() {
   opensanctionsUpdate = null;
   opensanctionsCheck.disabled = true;
   opensanctionsStart.hidden = true;
+  archivePlan = null;
+  archiveStart.hidden = true;
+  archivePreflight.disabled = true;
   opensanctionsUpdateStatus.textContent = "Сверяем версии снимка…";
+  archivePreflightStatus.textContent = "";
   setOpenSanctionsMessage("");
   try {
     opensanctionsUpdate = await opensanctionsRequest("/update-check");
@@ -782,6 +973,90 @@ async function checkOpenSanctionsUpdate() {
   } finally {
     opensanctionsChecking = false;
     if (opensanctionsCurrent?.can_start_import) opensanctionsCheck.disabled = false;
+  }
+}
+
+async function preflightOpenSanctionsArchive() {
+  if (archivePreflighting || archiveCurrent?.archive_active || archiveCurrent?.import_active) return;
+  if (!opensanctionsUpdate?.latest_version) await checkOpenSanctionsUpdate();
+  const version = opensanctionsUpdate?.latest_version;
+  if (!version) {
+    archivePreflightStatus.textContent = "Сначала дождитесь завершения активного импорта и сверки версии.";
+    return;
+  }
+  archivePreflighting = true;
+  archivePreflight.disabled = true;
+  archiveStart.hidden = true;
+  archivePlan = null;
+  archivePreflightStatus.textContent = "Проверяем snapshot, режим загрузки, PostgreSQL и дисковый запас…";
+  setArchiveMessage("");
+  try {
+    archivePlan = await opensanctionsRequest(
+      `/archive/preflight?expected_version=${encodeURIComponent(version)}`,
+    );
+    renderOpenSanctionsArchiveStatus(archiveCurrent || {});
+    if (!archivePlan.can_start) {
+      archivePreflightStatus.textContent += " Запуск пока недоступен.";
+    }
+  } catch (error) {
+    archivePreflightStatus.textContent = error.message;
+    setArchiveMessage(error.message, true);
+  } finally {
+    archivePreflighting = false;
+    archivePreflight.disabled = !opensanctionsUpdate?.latest_version ||
+      Boolean(archiveCurrent?.archive_active || archiveCurrent?.import_active);
+  }
+}
+
+async function startOpenSanctionsArchive() {
+  const version = archivePlan?.version;
+  if (archiveStarting || !version || !archivePlan?.can_start || archiveCurrent?.can_start === false) return;
+  const mode = archivePlan.download_mode === "parallel"
+    ? `${archivePlan.parallel_workers || 8} потоков`
+    : "один поток (сервер источника игнорирует Range)";
+  if (!confirm(
+    `Скачать ${formatImportBytes(archivePlan.archive_size_bytes)} в ${archivePlan.archive_path} (${mode}) и затем импортировать данные в PostgreSQL?`,
+  )) return;
+  archiveStarting = true;
+  archiveStart.disabled = true;
+  archivePreflight.disabled = true;
+  setArchiveMessage("Запускаем фоновую задачу скачивания и импорта…");
+  try {
+    await opensanctionsRequest("/archive/start", "POST", { expected_version: version });
+    archivePlan = null;
+    await refreshOpenSanctionsStatus();
+    setArchiveMessage("Задача принята systemd; прогресс обновляется автоматически.");
+  } catch (error) {
+    setArchiveMessage(error.message, true);
+    await refreshOpenSanctionsStatus();
+  } finally {
+    archiveStarting = false;
+    archiveStart.disabled = !archivePlan?.can_start || archiveCurrent?.can_start === false;
+  }
+}
+
+async function stopOpenSanctionsArchive() {
+  const version = archiveCurrent?.version;
+  if (archiveStopping || !version || !archiveCurrent?.archive_active) return;
+  const resumeText = archiveCurrent.download_mode === "parallel"
+    ? "Проверенные сегменты сохранятся для продолжения."
+    : "При следующем запуске single-stream скачивание начнётся с начала.";
+  if (!confirm(`Остановить задачу архива ${version}? ${resumeText}`)) return;
+  archiveStopping = true;
+  archiveStop.disabled = true;
+  setArchiveMessage("Останавливаем задачу…");
+  try {
+    await opensanctionsRequest("/archive/stop", "POST", { expected_version: version });
+    await refreshOpenSanctionsStatus();
+    setArchiveMessage(archiveCurrent?.download_mode === "parallel"
+      ? "Остановка принята; проверенные сегменты сохранены."
+      : "Остановка принята; повторная single-stream загрузка начнётся с начала.");
+  } catch (error) {
+    setArchiveMessage(error.message, true);
+    await refreshOpenSanctionsStatus();
+  } finally {
+    archiveStopping = false;
+    archiveStop.disabled = !archiveCurrent?.archive_active || archiveCurrent?.state === "stopping";
   }
 }
 
@@ -821,6 +1096,27 @@ async function startOpenSanctionsImport() {
     opensanctionsStarting = false;
     opensanctionsStart.disabled = !opensanctionsCurrent?.can_start_import || !opensanctionsUpdate?.can_start;
     if (opensanctionsCurrent?.state === "starting") scheduleOpenSanctionsRefresh(1000);
+  }
+}
+
+async function stopOpenSanctionsImport() {
+  const version = opensanctionsCurrent?.version;
+  if (opensanctionsStopping || !version || !opensanctionsCurrent?.unit_active) return;
+  if (!confirm(`Остановить импорт ${version}? Уже синхронизированные batches сохранятся; запуск можно будет возобновить.`)) return;
+  opensanctionsStopping = true;
+  opensanctionsStop.disabled = true;
+  setOpenSanctionsMessage("Останавливаем процесс и сохраняем текущий batch…");
+  try {
+    await opensanctionsRequest("/stop", "POST", { expected_version: version });
+    opensanctionsUpdate = null;
+    await refreshOpenSanctionsStatus();
+    setOpenSanctionsMessage("Импорт остановлен; синхронизированные batches сохранены.");
+  } catch (error) {
+    setOpenSanctionsMessage(error.message, true);
+    await refreshOpenSanctionsStatus();
+  } finally {
+    opensanctionsStopping = false;
+    opensanctionsStop.disabled = !opensanctionsCurrent?.unit_active || opensanctionsCurrent?.state === "stopping";
   }
 }
 
@@ -887,6 +1183,10 @@ document.getElementById("settings-delete").addEventListener("click", () => {
 });
 opensanctionsCheck.addEventListener("click", () => void checkOpenSanctionsUpdate());
 opensanctionsStart.addEventListener("click", () => void startOpenSanctionsImport());
+opensanctionsStop.addEventListener("click", () => void stopOpenSanctionsImport());
+archivePreflight.addEventListener("click", () => void preflightOpenSanctionsArchive());
+archiveStart.addEventListener("click", () => void startOpenSanctionsArchive());
+archiveStop.addEventListener("click", () => void stopOpenSanctionsArchive());
 opensanctionsPublish.addEventListener("click", async () => {
   if (opensanctionsPublishing || !opensanctionsCurrent?.can_publish) return;
   if (!confirm("Опубликовать проверенную базу OpenSanctions и заменить текущую базу поиска?")) return;

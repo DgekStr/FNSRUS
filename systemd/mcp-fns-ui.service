@@ -22,6 +22,9 @@ Environment=FNS_SETTINGS_LAN_NETWORKS=192.168.0.0/24,10.1.17.6/32,127.0.0.0/8,::
 Environment=MCP_EGRUL_DB=/var/lib/mcp-fns/egrul.sqlite
 Environment=MCP_EGRUL_DUMPS_DIR=/var/lib/mcp-fns/dumps
 Environment=FNS_OPENSANCTIONS_DB=/var/lib/mcp-fns/opensanctions.sqlite
+Environment=FNS_OPENSANCTIONS_ARCHIVE_DIR=/var/lib/mcp-fns/archives/opensanctions
+Environment=FNS_OPENSANCTIONS_ARCHIVE_STATUS=/var/lib/mcp-fns/opensanctions-archive-status.json
+Environment=FNS_OPENSANCTIONS_POSTGRES_DSN=dbname=fnsrus user=deploy host=/var/run/postgresql
 Environment=FNS_SETTINGS_PATH=/var/lib/mcp-fns/api-fns-settings.json
 EnvironmentFile=-/etc/mcp-fns.env
 ExecStart=/srv/mcp-fns/.venv/bin/python /srv/mcp-fns/server.py

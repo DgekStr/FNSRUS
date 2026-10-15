@@ -5,6 +5,7 @@ import os
 import re
 import socket
 import sqlite3
+import shutil
 import tempfile
 import time
 from collections import deque
@@ -23,7 +24,9 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 import api_fns
+import scripts.download_opensanctions_archive as opensanctions_archive
 import scripts.import_opensanctions as opensanctions_import
+import scripts.import_opensanctions_postgres as opensanctions_postgres_import
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +43,13 @@ WIREGUARD_CONTROL_SOCKET = Path(os.environ.get("FNS_WG_CONTROL_SOCKET", "/run/fn
 OPENSANCTIONS_CONTROL_SOCKET = Path(os.environ.get("FNS_OPENSANCTIONS_CONTROL_SOCKET", "/run/fnsrus-import-control.sock"))
 OPENSANCTIONS_DB = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
 OPENSANCTIONS_STATUS_PATH = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
+OPENSANCTIONS_ARCHIVE_DIR = Path(os.environ.get(
+    "FNS_OPENSANCTIONS_ARCHIVE_DIR", "/var/lib/mcp-fns/archives/opensanctions",
+))
+OPENSANCTIONS_ARCHIVE_STATUS_PATH = Path(os.environ.get(
+    "FNS_OPENSANCTIONS_ARCHIVE_STATUS", "/var/lib/mcp-fns/opensanctions-archive-status.json",
+))
+OPENSANCTIONS_POSTGRES_DSN = os.environ.get("FNS_OPENSANCTIONS_POSTGRES_DSN", "")
 OPENSANCTIONS_ENTITY_COUNTS = {"20260912190833-iof": 53_107_328}
 TOOL_NAMES = frozenset({
     "check_contractor", "check_inn", "check_ogrn", "get_legal_status",
@@ -99,6 +109,12 @@ class SearchRequest(BaseModel):
 class WireGuardToggleRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = Field(strict=True)
+
+
+class WireGuardActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(strict=True, pattern="^(save|enable|disable)$")
+    enabled: bool | None = Field(default=None, strict=True)
 
 
 class OpenSanctionsImportRequest(BaseModel):
@@ -316,6 +332,66 @@ def search_opensanctions_database(query):
         response["snapshot_date"] = metadata.get("updated_at", "")[:10]
         response["last_source_change"] = metadata.get("last_change", "")[:10]
         response["license"] = metadata.get("license", "CC BY-NC 4.0")
+        if metadata.get("sync_state") in {"running", "interrupted"}:
+            response["partial_sync"] = True
+            response["sync_version"] = metadata.get("pending_version")
+            response["synced_companies"] = metadata.get("sync_companies", "0")
+    return response
+
+
+def read_opensanctions_postgres_metadata():
+    if not OPENSANCTIONS_POSTGRES_DSN:
+        return {}
+    try:
+        import psycopg
+        with psycopg.connect(OPENSANCTIONS_POSTGRES_DSN, connect_timeout=3) as connection:
+            rows = connection.execute(
+                "SELECT key, value FROM opensanctions_metadata"
+            ).fetchall()
+    except Exception as error:
+        logger.warning("OpenSanctions PostgreSQL metadata unavailable (%s)", type(error).__name__)
+        return {}
+    return dict(rows)
+
+
+def search_opensanctions_postgres(query):
+    metadata = read_opensanctions_postgres_metadata()
+    if not metadata.get("version"):
+        return None
+    tokens = [
+        "".join(character for character in token if character.isalnum() or character == "_")
+        for token in query.replace('"', " ").split()
+    ]
+    tokens = [token for token in tokens if len(token) >= 2]
+    if not tokens:
+        return {"results": [], "truncated": False}
+    tsquery = " & ".join(f"{token}:*" for token in tokens)
+    import psycopg
+    with psycopg.connect(OPENSANCTIONS_POSTGRES_DSN, connect_timeout=3) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT inn, name, city
+            FROM {opensanctions_postgres_import.COMPANY_TABLE}
+            WHERE to_tsvector('simple', name) @@ to_tsquery('simple', %s)
+            ORDER BY ts_rank(to_tsvector('simple', name), to_tsquery('simple', %s)) DESC
+            LIMIT %s
+            """,
+            (tsquery, tsquery, MAX_SEARCH_RESULTS + 1),
+        ).fetchall()
+    response = {
+        "results": [{"name": row[1], "inn": row[0], "city": row[2] or "—"}
+                    for row in rows[:MAX_SEARCH_RESULTS]],
+        "truncated": len(rows) > MAX_SEARCH_RESULTS,
+        "source": metadata.get("source", "OpenSanctions"),
+        "dataset": metadata.get("dataset", "ru_egrul"),
+        "snapshot_date": metadata.get("updated_at", "")[:10],
+        "last_source_change": metadata.get("last_change", "")[:10],
+        "license": metadata.get("license", "CC BY-NC 4.0"),
+    }
+    if metadata.get("sync_state") in {"postgres_importing", "interrupted"}:
+        response["partial_sync"] = True
+        response["sync_version"] = metadata.get("pending_version")
+        response["synced_companies"] = metadata.get("sync_companies", "0")
     return response
 
 
@@ -327,7 +403,66 @@ def read_opensanctions_import_status():
     return status if isinstance(status, dict) else {}
 
 
+def read_opensanctions_archive_status():
+    try:
+        status = json.loads(OPENSANCTIONS_ARCHIVE_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return status if isinstance(status, dict) else {}
+
+
+def get_opensanctions_archive_status():
+    status = read_opensanctions_archive_status()
+    try:
+        control_status = import_control("status")
+    except APIError:
+        control_status = {}
+    configured_dir = OPENSANCTIONS_ARCHIVE_DIR.expanduser()
+    existing_dir = configured_dir
+    while not existing_dir.exists() and existing_dir != existing_dir.parent:
+        existing_dir = existing_dir.parent
+    available = shutil.disk_usage(existing_dir).free
+    postgres_status = opensanctions_postgres_import.check_postgres(OPENSANCTIONS_POSTGRES_DSN)
+    archive_path = status.get("archive_path")
+    version = status.get("version") or control_status.get("archive_version")
+    if not archive_path and isinstance(version, str) and re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version):
+        archive_path = str(opensanctions_archive.archive_paths(version, configured_dir)[0])
+    return {
+        **status,
+        "state": status.get("state", "not_started"),
+        "archive_path": archive_path,
+        "archive_dir": str(configured_dir),
+        "available_bytes": available,
+        "postgres_configured": postgres_status["configured"],
+        "postgres_ready": postgres_status["ready"],
+        "postgres_error": postgres_status["error"],
+        "archive_active": bool(control_status.get("archive_active")),
+        "import_active": bool(control_status.get("import_active")),
+        "can_start": control_status.get("ok") is True and not control_status.get("active")
+        and postgres_status["ready"],
+    }
+
+
+def reconcile_opensanctions_import_status(control_status):
+    status = read_opensanctions_import_status()
+    active_states = {"starting", "checking", "running", "retrying", "stopping", "indexing", "validating"}
+    if control_status.get("ok") is True and not control_status.get("active") and status.get("state") in active_states:
+        opensanctions_import.write_status_file(
+            OPENSANCTIONS_STATUS_PATH,
+            state="interrupted",
+            error="Процесс импорта завершился; синхронизированные batches сохранены.",
+            retry_in_seconds=0,
+        )
+        return read_opensanctions_import_status()
+    return status
+
+
 def read_opensanctions_database_version():
+    postgres_metadata = read_opensanctions_postgres_metadata()
+    postgres_version = postgres_metadata.get("version")
+    if (postgres_metadata.get("sync_state") == "complete" and isinstance(postgres_version, str) and
+            re.fullmatch(r"[0-9]{14}-[a-z0-9]+", postgres_version)):
+        return postgres_version
     if not OPENSANCTIONS_DB.is_file():
         return None
     try:
@@ -356,7 +491,7 @@ def opensanctions_version_is_newer(current_version, latest_version):
 
 def opensanctions_average_rate(status):
     global opensanctions_progress_run
-    if status.get("state") != "running":
+    if status.get("state") not in {"running", "retrying"}:
         with opensanctions_progress_lock:
             opensanctions_progress_samples.clear()
             opensanctions_progress_run = None
@@ -369,7 +504,7 @@ def opensanctions_average_rate(status):
         timestamp = updated_at.replace(tzinfo=timezone.utc).timestamp() if updated_at.tzinfo is None else updated_at.timestamp()
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
         return None
-    run = (version, started_at)
+    run = (version, started_at, status.get("attempt", 0))
     with opensanctions_progress_lock:
         if opensanctions_progress_run != run:
             opensanctions_progress_samples.clear()
@@ -388,15 +523,17 @@ def opensanctions_average_rate(status):
 
 
 def get_opensanctions_import_status():
-    status = read_opensanctions_import_status()
-    state = status.get("state", "not_started")
     try:
         control_status = import_control("status")
     except APIError:
         control_status = {}
+    status = reconcile_opensanctions_import_status(control_status)
+    state = status.get("state", "not_started")
     control_available = control_status.get("ok") is True
-    unit_active = bool(control_status.get("active"))
-    active_states = {"starting", "checking", "running", "indexing", "validating"}
+    unit_active = bool(control_status.get("import_active", control_status.get("active")))
+    archive_active = bool(control_status.get("archive_active"))
+    any_unit_active = bool(control_status.get("active"))
+    active_states = {"starting", "checking", "running", "retrying", "stopping", "indexing", "validating"}
     unit_starting = unit_active and state not in active_states | {"ready_to_publish"}
     if unit_starting:
         state = "starting"
@@ -406,6 +543,7 @@ def get_opensanctions_import_status():
             "version": control_status.get("expected_version") or status.get("version"),
             "scanned": 0,
             "imported": 0,
+            "synced_companies": 0,
             "expected_entities": None,
             "updated_at": None,
             "source_updated_at": None,
@@ -416,9 +554,10 @@ def get_opensanctions_import_status():
     try:
         scanned = max(0, int(status.get("scanned", 0)))
         imported = max(0, int(status.get("imported", 0)))
+        synced_companies = max(0, int(status.get("synced_companies", imported)))
         expected = int(status.get("expected_entities") or OPENSANCTIONS_ENTITY_COUNTS.get(version, 0))
     except (TypeError, ValueError):
-        scanned, imported, expected = 0, 0, 0
+        scanned, imported, synced_companies, expected = 0, 0, 0, 0
     progress = round(min(100, scanned * 100 / expected), 1) if expected > 0 else None
     average_rate = opensanctions_average_rate(status)
     eta_seconds = int((expected - scanned) / average_rate) if average_rate and expected > scanned else None
@@ -427,39 +566,46 @@ def get_opensanctions_import_status():
         staging = OPENSANCTIONS_DB.with_name(f".{OPENSANCTIONS_DB.name}.{version}.tmp")
     published_version = read_opensanctions_database_version()
     published = published_version is not None
-    can_start_import = control_available and not unit_active and state not in active_states | {"ready_to_publish"}
+    can_start_import = control_available and not any_unit_active and state not in active_states | {"ready_to_publish"}
     return {
         "state": state,
         "version": version,
         "published_version": published_version,
         "scanned": scanned,
         "imported": imported,
+        "synced_companies": synced_companies,
         "expected_entities": expected or None,
         "progress_percent": progress,
         "average_rate_per_second": round(average_rate, 1) if average_rate else None,
         "eta_seconds": eta_seconds,
         "started_at": status.get("started_at"),
         "updated_at": status.get("updated_at"),
+        "attempt": status.get("attempt", 0),
+        "max_attempts": status.get("max_attempts"),
+        "retry_in_seconds": status.get("retry_in_seconds"),
+        "retry_at": status.get("retry_at"),
+        "retry_error": status.get("error") if state == "retrying" else None,
         "source_updated_at": status.get("source_updated_at"),
         "last_source_change": status.get("last_source_change", status.get("last_change")),
-        "invalid_lines": status.get("invalid_lines", 0),
-        "error": status.get("error"),
+        "invalid_lines": 0 if state in {"starting", "checking"} or (state == "running" and scanned == 0)
+        else status.get("invalid_lines", 0),
+        "error": status.get("error") if state in {"failed", "interrupted", "retrying"} else None,
         "published": published,
         "can_publish": state == "ready_to_publish" and staging is not None and staging.is_file(),
         "can_start_import": can_start_import,
         "import_control_available": control_available,
         "unit_active": unit_active,
+        "archive_active": archive_active,
     }
 
 
 async def opensanctions_import_in_progress():
-    if read_opensanctions_import_status().get("state") in {
-        "starting", "checking", "running", "indexing", "validating", "ready_to_publish",
-    }:
-        return True
     try:
         control_status = await asyncio.to_thread(import_control, "status")
-        return bool(control_status.get("active"))
+        status = await asyncio.to_thread(reconcile_opensanctions_import_status, control_status)
+        return bool(control_status.get("active")) or status.get("state") in {
+            "starting", "checking", "running", "retrying", "stopping", "indexing", "validating", "ready_to_publish",
+        }
     except APIError:
         return False
 
@@ -470,6 +616,11 @@ async def call_search_by_name(query):
     async with call_lock:
         record_call()
         try:
+            if OPENSANCTIONS_POSTGRES_DSN:
+                async with asyncio.timeout(EGRUL_CALL_TIMEOUT):
+                    response = await asyncio.to_thread(search_opensanctions_postgres, query)
+                if response is not None:
+                    return response
             if OPENSANCTIONS_DB.is_file():
                 async with asyncio.timeout(EGRUL_CALL_TIMEOUT):
                     response = await asyncio.to_thread(search_opensanctions_database, query)
@@ -509,14 +660,19 @@ async def call_search_by_name(query):
             raise APIError(503, "search_unavailable", SEARCH_UNAVAILABLE_MESSAGE) from error
 
 
-def wireguard_control(command):
-    if command not in {"status", "connect", "disconnect"}:
+def wireguard_control(command, enabled=None):
+    if command not in {"status", "connect", "disconnect", "save", "enable", "disable"}:
         raise ValueError("invalid WireGuard control command")
+    if not hasattr(socket, "AF_UNIX"):
+        raise APIError(503, "wireguard_control_unavailable", "Управление WireGuard временно недоступно.")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(35)
             client.connect(str(WIREGUARD_CONTROL_SOCKET))
-            client.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
+            payload = {"command": command}
+            if enabled is not None:
+                payload["enabled"] = enabled
+            client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
             response = client.makefile("rb").readline(4097)
         if len(response) > 4096 or not response.endswith(b"\n"):
             raise ValueError("invalid WireGuard control response size")
@@ -530,14 +686,16 @@ def wireguard_control(command):
 
 
 def import_control(command, expected_version=None):
-    if command not in {"status", "start"}:
+    if command not in {"status", "start", "stop", "archive_start", "archive_stop"}:
         raise ValueError("invalid OpenSanctions control command")
+    if not hasattr(socket, "AF_UNIX"):
+        raise APIError(503, "import_control_unavailable", "Запуск импорта временно недоступен.")
     payload = {"command": command}
     if expected_version is not None:
         payload["expected_version"] = expected_version
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(35 if command == "start" else 15)
+            client.settimeout(180 if command in {"stop", "archive_stop"} else 35 if command in {"start", "archive_start"} else 15)
             client.connect(str(OPENSANCTIONS_CONTROL_SOCKET))
             client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
             response = client.makefile("rb").readline(2049)
@@ -680,6 +838,18 @@ async def update_wireguard_settings(body: WireGuardToggleRequest):
     return result
 
 
+@app.post("/api/settings/wireguard/action")
+async def apply_wireguard_action(body: WireGuardActionRequest):
+    if body.action == "save" and body.enabled is None:
+        raise APIError(422, "wireguard_autostart_required", "Укажите состояние автозапуска WireGuard.")
+    result = await asyncio.to_thread(wireguard_control, body.action, body.enabled)
+    if not result["ok"]:
+        code = result.get("error", "wireguard_control_failed")
+        status = 409 if code == "not_configured" else 503
+        raise APIError(status, code, "Не удалось применить действие WireGuard.")
+    return result
+
+
 @app.get("/api/settings/opensanctions")
 async def get_opensanctions_settings():
     return await asyncio.to_thread(get_opensanctions_import_status)
@@ -687,18 +857,18 @@ async def get_opensanctions_settings():
 
 @app.get("/api/settings/opensanctions/update-check")
 async def check_opensanctions_update():
-    status = read_opensanctions_import_status()
     try:
         control_status = await asyncio.to_thread(import_control, "status")
     except APIError as error:
         raise APIError(503, "import_control_unavailable", "Запуск импорта временно недоступен.") from error
+    status = await asyncio.to_thread(reconcile_opensanctions_import_status, control_status)
     current_version = await asyncio.to_thread(read_opensanctions_database_version)
     if status.get("state") == "ready_to_publish":
         return {
             "decision": "publish_required", "current_version": current_version,
             "latest_version": None, "can_start": False,
         }
-    if status.get("state") in {"starting", "checking", "running", "indexing", "validating"} or control_status.get("active"):
+    if status.get("state") in {"starting", "checking", "running", "retrying", "stopping", "indexing", "validating"} or control_status.get("active"):
         return {
             "decision": "import_running", "current_version": current_version,
             "latest_version": None, "can_start": False,
@@ -737,10 +907,14 @@ async def start_opensanctions_import(body: OpenSanctionsImportRequest):
     expected_version = body.expected_version
     if not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
         raise APIError(422, "invalid_import_version", "Версия OpenSanctions указана неверно.")
-    status = read_opensanctions_import_status()
+    try:
+        control_status = await asyncio.to_thread(import_control, "status")
+    except APIError as error:
+        raise APIError(503, "import_control_unavailable", "Запуск импорта временно недоступен.") from error
+    status = await asyncio.to_thread(reconcile_opensanctions_import_status, control_status)
     if status.get("state") == "ready_to_publish":
         raise APIError(409, "publish_required", "Сначала опубликуйте завершённую staging-базу.")
-    if status.get("state") in {"starting", "checking", "running", "indexing", "validating"}:
+    if status.get("state") in {"starting", "checking", "running", "retrying", "stopping", "indexing", "validating"} or control_status.get("active"):
         raise APIError(409, "import_busy", "Импорт уже выполняется.")
     try:
         latest = await asyncio.to_thread(opensanctions_import.fetch_index)
@@ -771,6 +945,119 @@ async def start_opensanctions_import(body: OpenSanctionsImportRequest):
         {"state": "starting", "version": latest_version, "entity_count": latest["entity_count"]},
         status_code=202,
     )
+
+
+@app.post("/api/settings/opensanctions/stop")
+async def stop_opensanctions_import(body: OpenSanctionsImportRequest):
+    version = body.expected_version
+    if not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", version):
+        raise APIError(422, "invalid_import_version", "Версия OpenSanctions указана неверно.")
+    result = await asyncio.to_thread(import_control, "stop", version)
+    if not result["ok"]:
+        code = result.get("error", "import_stop_failed")
+        if code == "import_not_active":
+            raise APIError(409, code, "Этот импорт уже не выполняется.")
+        raise APIError(503, code, "Не удалось безопасно остановить импорт.")
+    return JSONResponse({"state": "stopping", "version": version}, status_code=202)
+
+
+@app.get("/api/settings/opensanctions/archive")
+async def get_opensanctions_archive_settings():
+    return await asyncio.to_thread(get_opensanctions_archive_status)
+
+
+@app.get("/api/settings/opensanctions/archive/preflight")
+async def preflight_opensanctions_archive(expected_version: str):
+    if not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
+        raise APIError(422, "invalid_import_version", "Версия OpenSanctions указана неверно.")
+    try:
+        control_status = await asyncio.to_thread(import_control, "status")
+    except APIError as error:
+        raise APIError(503, "import_control_unavailable", "Проверка systemd недоступна.") from error
+    if control_status.get("active"):
+        raise APIError(409, "import_busy", "Другой импорт уже выполняется.")
+    postgres_status = await asyncio.to_thread(
+        opensanctions_postgres_import.check_postgres, OPENSANCTIONS_POSTGRES_DSN,
+    )
+    index = await asyncio.to_thread(opensanctions_import.fetch_index)
+    if index["version"] != expected_version:
+        raise APIError(409, "snapshot_changed", "Snapshot обновился; повторите сверку версий.",
+                       {"latest_version": index["version"]})
+    range_supported = await asyncio.to_thread(opensanctions_archive.probe_range, index)
+    plan = await asyncio.to_thread(
+        opensanctions_archive.archive_preflight,
+        index,
+        OPENSANCTIONS_ARCHIVE_DIR,
+        opensanctions_archive.POSTGRES_RESERVE_BYTES,
+        range_supported,
+    )
+    return {
+        **plan,
+        "version": index["version"],
+        "entity_count": index["entity_count"],
+        "postgres_configured": postgres_status["configured"],
+        "postgres_ready": postgres_status["ready"],
+        "postgres_error": postgres_status["error"],
+        "can_start": plan["space_sufficient"] and postgres_status["ready"],
+        "download_mode": "parallel" if range_supported else "single-stream",
+    }
+
+
+@app.post("/api/settings/opensanctions/archive/start")
+async def start_opensanctions_archive(body: OpenSanctionsImportRequest):
+    expected_version = body.expected_version
+    if not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
+        raise APIError(422, "invalid_import_version", "Версия OpenSanctions указана неверно.")
+    try:
+        control_status = await asyncio.to_thread(import_control, "status")
+    except APIError as error:
+        raise APIError(503, "import_control_unavailable", "Проверка systemd недоступна.") from error
+    if control_status.get("active"):
+        raise APIError(409, "import_busy", "Другой импорт уже выполняется.")
+    postgres_status = await asyncio.to_thread(
+        opensanctions_postgres_import.check_postgres, OPENSANCTIONS_POSTGRES_DSN,
+    )
+    if not postgres_status["ready"]:
+        error = postgres_status["error"]
+        code = "postgres_not_configured" if error == "not_configured" else "postgres_unavailable"
+        raise APIError(503, code, "PostgreSQL недоступен или не имеет нужных прав.")
+    index = await asyncio.to_thread(opensanctions_import.fetch_index)
+    if index["version"] != expected_version:
+        raise APIError(409, "snapshot_changed", "Snapshot обновился; повторите сверку версий.",
+                       {"latest_version": index["version"]})
+    range_supported = await asyncio.to_thread(opensanctions_archive.probe_range, index)
+    plan = await asyncio.to_thread(
+        opensanctions_archive.archive_preflight,
+        index,
+        OPENSANCTIONS_ARCHIVE_DIR,
+        opensanctions_archive.POSTGRES_RESERVE_BYTES,
+        range_supported,
+    )
+    if not plan["space_sufficient"]:
+        raise APIError(507, "insufficient_archive_space", "Недостаточно свободного места для архива и PostgreSQL.",
+                       {"available_bytes": plan["available_bytes"],
+                        "required_free_bytes": plan["required_free_bytes"]})
+    result = await asyncio.to_thread(import_control, "archive_start", expected_version)
+    if not result["ok"]:
+        if result.get("error") == "import_busy":
+            raise APIError(409, "import_busy", "Другой импорт уже выполняется.")
+        raise APIError(503, "archive_start_failed", "Не удалось запустить archive job.")
+    return JSONResponse({
+        "state": "starting", "version": expected_version,
+        "archive_size_bytes": index["resource_size"],
+        "download_mode": "parallel" if range_supported else "single-stream",
+        "workers": opensanctions_archive.DOWNLOAD_WORKERS if range_supported else 1,
+    }, status_code=202)
+
+
+@app.post("/api/settings/opensanctions/archive/stop")
+async def stop_opensanctions_archive(body: OpenSanctionsImportRequest):
+    result = await asyncio.to_thread(import_control, "archive_stop", body.expected_version)
+    if not result["ok"]:
+        code = result.get("error", "archive_stop_failed")
+        status = 409 if code == "archive_not_active" else 503
+        raise APIError(status, code, "Не удалось остановить archive job.")
+    return JSONResponse({"state": "stopping", "version": body.expected_version}, status_code=202)
 
 
 @app.post("/api/settings/opensanctions/publish")

@@ -8,6 +8,7 @@ Group=root
 StandardInput=socket
 StandardOutput=socket
 ExecStart=/usr/bin/python3 /usr/local/libexec/fnsrus-import-control
+TimeoutStartSec=180
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

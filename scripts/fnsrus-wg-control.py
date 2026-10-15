@@ -60,14 +60,22 @@ def status():
     }
 
 
-def handle(command):
+def handle(command, enabled=None):
     if command == "status":
         return status()
-    if command not in {"connect", "disconnect"}:
+    if command not in {"connect", "disconnect", "save", "enable", "disable"}:
         return {"ok": False, "error": "invalid_command"}
     if not CONFIG.is_file():
         return {"ok": False, "error": "not_configured"}
-    if command == "connect":
+    if command == "save":
+        if not isinstance(enabled, bool):
+            return {"ok": False, "error": "invalid_request"}
+        result = systemctl("enable" if enabled else "disable", UNIT)
+    elif command == "enable":
+        result = systemctl("start", UNIT)
+    elif command == "disable":
+        result = systemctl("stop", UNIT)
+    elif command == "connect":
         result = systemctl("enable", "--now", UNIT)
     else:
         result = systemctl("disable", "--now", UNIT)
@@ -84,7 +92,8 @@ def main():
         try:
             request = json.loads(raw or b"{}")
             command = request.get("command") if isinstance(request, dict) else None
-            response = handle(command)
+            enabled = request.get("enabled") if isinstance(request, dict) else None
+            response = handle(command, enabled)
         except (ValueError, TypeError):
             response = {"ok": False, "error": "invalid_request"}
     sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")

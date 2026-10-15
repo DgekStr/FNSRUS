@@ -8,11 +8,13 @@ import json
 import hashlib
 import os
 import re
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,10 +27,12 @@ PROXY = "socks5h://10.8.0.1:19450"
 DATABASE = Path(os.environ.get("FNS_OPENSANCTIONS_DB", "/var/lib/mcp-fns/opensanctions.sqlite"))
 STATUS_FILE = Path(os.environ.get("FNS_OPENSANCTIONS_STATUS", "/var/lib/mcp-fns/opensanctions-import-status.json"))
 MIN_FREE_BYTES = 4 * 1024**3
-BATCH_SIZE = 10_000
-BATCH_SIZE = 10_000
+BATCH_SIZE = 100_000
 STATUS_INTERVAL = 100_000
 MAX_LINE_BYTES = 2 * 1024**2
+MAX_DOWNLOAD_ATTEMPTS = 8
+RETRY_BACKOFF_SECONDS = (15, 30, 60, 120, 300, 600, 900)
+RETRYABLE_CURL_CODES = {7, 18, 22, 28, 52, 55, 56, 92}
 DATASET_URL = "https://www.opensanctions.org/datasets/ru_egrul/"
 LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
 
@@ -42,6 +46,14 @@ class ImportNotReadyError(RuntimeError):
 
 
 class InvalidImportDatabaseError(RuntimeError):
+    pass
+
+
+class RetryableImportError(RuntimeError):
+    pass
+
+
+class ImportStopRequested(RuntimeError):
     pass
 
 
@@ -71,7 +83,8 @@ def dataset_lock(database: Path):
 
 def curl_command(url: str) -> list[str]:
     return [
-        "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error", "--compressed",
+        "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error", "--compressed", "--http1.1",
+        "--connect-timeout", "30", "--speed-time", "120", "--speed-limit", "1024",
         "--proxy", PROXY, url,
     ]
 
@@ -183,58 +196,129 @@ def create_database(path: Path) -> sqlite3.Connection:
             ogrn TEXT,
             name TEXT NOT NULL,
             city TEXT NOT NULL,
-            entity_id TEXT NOT NULL
+            entity_id TEXT NOT NULL,
+            last_seen_version TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX idx_companies_ogrn ON companies(ogrn);
+        CREATE INDEX idx_companies_last_seen_version ON companies(last_seen_version);
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
     return connection
 
 
-def insert_batch(connection: sqlite3.Connection, rows: list[tuple]) -> int:
-    if not rows:
-        return 0
-    before = connection.total_changes
+def ensure_live_database(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = create_database(path) if not path.exists() else sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA cache_size=-262144")
+    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS companies (
+            inn TEXT PRIMARY KEY,
+            ogrn TEXT,
+            name TEXT NOT NULL,
+            city TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            last_seen_version TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_companies_ogrn ON companies(ogrn)")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(companies)")}
+    if "last_seen_version" not in columns:
+        connection.execute("ALTER TABLE companies ADD COLUMN last_seen_version TEXT NOT NULL DEFAULT ''")
+        metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+        if metadata.get("version"):
+            connection.execute(
+                "UPDATE companies SET last_seen_version = ? WHERE last_seen_version = ''",
+                (metadata["version"],),
+            )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_companies_last_seen_version ON companies(last_seen_version)")
+    fts_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'companies_fts'"
+    ).fetchone()
+    if not fts_exists:
+        connection.execute("""
+            CREATE VIRTUAL TABLE companies_fts USING fts5(
+                name, content='companies', content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+        """)
+        connection.execute("INSERT INTO companies_fts(companies_fts) VALUES ('rebuild')")
+    connection.executescript("""
+        CREATE TRIGGER IF NOT EXISTS companies_ai AFTER INSERT ON companies BEGIN
+            INSERT INTO companies_fts(rowid, name) VALUES (new.rowid, new.name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS companies_ad AFTER DELETE ON companies BEGIN
+            INSERT INTO companies_fts(companies_fts, rowid, name) VALUES ('delete', old.rowid, old.name);
+        END;
+        CREATE TRIGGER IF NOT EXISTS companies_au AFTER UPDATE OF name ON companies BEGIN
+            INSERT INTO companies_fts(companies_fts, rowid, name) VALUES ('delete', old.rowid, old.name);
+            INSERT INTO companies_fts(rowid, name) VALUES (new.rowid, new.name);
+        END;
+    """)
+    connection.commit()
+    return connection
+
+
+def count_synced_companies(connection: sqlite3.Connection, version: str) -> int:
+    return connection.execute(
+        "SELECT COUNT(*) FROM companies WHERE last_seen_version = ?", (version,)
+    ).fetchone()[0]
+
+
+def update_metadata(connection: sqlite3.Connection, values: dict[str, str]) -> None:
     connection.executemany(
-        "INSERT OR IGNORE INTO companies(inn, ogrn, name, city, entity_id) VALUES (?, ?, ?, ?, ?)",
-        rows,
+        "INSERT INTO metadata(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        values.items(),
     )
     connection.commit()
-    return connection.total_changes - before
 
 
-def _import_snapshot_locked(expected_version: str | None = None) -> dict:
-    DATABASE.parent.mkdir(parents=True, exist_ok=True)
-    started_at = datetime.now(UTC).isoformat()
-    write_status(state="checking", version=expected_version, imported=0, scanned=0, started_at=started_at)
-    try:
-        if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
-            raise RuntimeError("Меньше 4 ГБ свободно; импорт остановлен до скачивания")
-        if expected_version is not None and not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
-            raise ValueError("Requested OpenSanctions version is invalid")
-        index = fetch_index()
-        if expected_version is not None and index["version"] != expected_version:
-            raise RuntimeError("OpenSanctions snapshot changed after version check; run the version check again")
-    except Exception as error:
-        write_status(state="failed", version=expected_version, imported=0, scanned=0,
-                     error=f"{type(error).__name__}: {error}")
-        raise
-    staging = DATABASE.with_name(f".{DATABASE.name}.{index['version']}.tmp")
-    staging.unlink(missing_ok=True)
-    connection = create_database(staging)
-    process = None
+def insert_batch(connection: sqlite3.Connection, rows: list[tuple], version: str = "") -> int:
+    if not rows:
+        return 0
+    cursor = connection.executemany(
+        """
+        INSERT INTO companies(inn, ogrn, name, city, entity_id, last_seen_version)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(inn) DO UPDATE SET
+            ogrn = excluded.ogrn,
+            name = excluded.name,
+            city = excluded.city,
+            entity_id = excluded.entity_id,
+            last_seen_version = excluded.last_seen_version
+        WHERE companies.ogrn IS NOT excluded.ogrn
+           OR companies.name IS NOT excluded.name
+           OR companies.city IS NOT excluded.city
+           OR companies.entity_id IS NOT excluded.entity_id
+           OR companies.last_seen_version IS NOT excluded.last_seen_version
+        """,
+        [(*row, version) for row in rows],
+    )
+    connection.commit()
+    return max(0, cursor.rowcount)
+
+
+def download_attempt(connection: sqlite3.Connection, index: dict, attempt: int,
+                     prior_imported: int, synced: int, started_at: str) -> dict:
+    version = index["version"]
+    pending: list[tuple] = []
     imported = 0
-    seen = 0
+    scanned = 0
     stream_bytes = 0
     stream_hash = hashlib.sha1()
     invalid = 0
-    pending: list[tuple] = []
     last_status_at = 0
-    staging_ready = False
-    write_status(state="running", version=index["version"], source_updated_at=index["updated_at"],
+    process = None
+    write_status(state="running", version=version, source_updated_at=index["updated_at"],
                  last_source_change=index["last_change"], expected_bytes=index["resource_size"],
-                 expected_entities=index["entity_count"], imported=0, scanned=0,
-                 started_at=started_at)
+                 expected_entities=index["entity_count"], attempt=attempt,
+                 max_attempts=MAX_DOWNLOAD_ATTEMPTS, retry_in_seconds=0,
+                 imported=prior_imported, synced_companies=synced, scanned=0,
+                 invalid_lines=0, error=None, started_at=started_at)
     try:
         process = subprocess.Popen(
             curl_command(index["resource_url"]),
@@ -244,7 +328,7 @@ def _import_snapshot_locked(expected_version: str | None = None) -> dict:
         )
         assert process.stdout is not None
         for raw_line in process.stdout:
-            seen += 1
+            scanned += 1
             stream_bytes += len(raw_line)
             stream_hash.update(raw_line)
             if len(raw_line) > MAX_LINE_BYTES:
@@ -259,74 +343,58 @@ def _import_snapshot_locked(expected_version: str | None = None) -> dict:
                     if row is not None:
                         pending.append(row)
                         if len(pending) >= BATCH_SIZE:
-                            imported += insert_batch(connection, pending)
+                            imported += insert_batch(connection, pending, version)
                             pending.clear()
                             if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
                                 raise RuntimeError("Свободное место упало ниже 4 ГБ; импорт остановлен")
-            if seen - last_status_at >= STATUS_INTERVAL:
+            if scanned - last_status_at >= STATUS_INTERVAL:
                 if pending:
-                    imported += insert_batch(connection, pending)
+                    imported += insert_batch(connection, pending, version)
                     pending.clear()
                 if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
                     raise RuntimeError("Свободное место упало ниже 4 ГБ; импорт остановлен")
-                write_status(state="running", version=index["version"], imported=imported, scanned=seen,
-                             invalid_lines=invalid)
-                last_status_at = seen
+                synced = count_synced_companies(connection, version)
+                update_metadata(connection, {
+                    "sync_scanned": str(scanned),
+                    "sync_companies": str(synced),
+                    "sync_attempt": str(attempt),
+                    "sync_invalid_lines": str(invalid),
+                    "sync_error": "",
+                })
+                write_status(state="running", version=version, attempt=attempt,
+                             max_attempts=MAX_DOWNLOAD_ATTEMPTS, imported=prior_imported + imported,
+                             synced_companies=synced, scanned=scanned,
+                             invalid_lines=invalid, error=None)
+                last_status_at = scanned
         if pending:
-            imported += insert_batch(connection, pending)
+            imported += insert_batch(connection, pending, version)
             pending.clear()
         return_code = process.wait()
         if return_code != 0:
             error = process.stderr.read(4096).decode("utf-8", errors="replace") if process.stderr else "curl failed"
-            raise RuntimeError(f"Загрузка OpenSanctions завершилась с кодом {return_code}: {error[:300]}")
+            curl_match = re.search(r"curl: \(([0-9]+)\)", error)
+            curl_code = int(curl_match.group(1)) if curl_match else None
+            message = f"Загрузка OpenSanctions завершилась с кодом {return_code}: {error[:300]}"
+            if curl_code in RETRYABLE_CURL_CODES:
+                raise RetryableImportError(message)
+            raise RuntimeError(message)
         if stream_bytes != index["resource_size"]:
-            raise RuntimeError(f"Размер FTM stream не совпал: ожидалось {index['resource_size']}, получено {stream_bytes}")
+            raise RetryableImportError(
+                f"Размер FTM stream не совпал: ожидалось {index['resource_size']}, получено {stream_bytes}"
+            )
         if stream_hash.hexdigest() != index["resource_checksum"]:
-            raise RuntimeError("SHA-1 FTM stream не совпал с OpenSanctions index")
+            raise RetryableImportError("SHA-1 FTM stream не совпал с OpenSanctions index")
         if invalid:
             raise RuntimeError(f"FTM stream содержит некорректные строки: {invalid}")
-        expected_entities = index["entity_count"]
-        if seen != expected_entities:
-            raise RuntimeError(f"FTM stream неполный: ожидалось {expected_entities}, получено {seen}")
-        if imported == 0:
-            raise RuntimeError("В FTM snapshot не найдено ни одной Company с валидным ИНН")
-        write_status(state="indexing", version=index["version"], imported=imported, scanned=seen)
-        connection.execute("""
-            CREATE VIRTUAL TABLE companies_fts USING fts5(
-                name, content='companies', content_rowid='rowid',
-                tokenize='unicode61 remove_diacritics 2'
-            )
-        """)
-        connection.execute("INSERT INTO companies_fts(companies_fts) VALUES ('rebuild')")
-        metadata = {
-            "source": "OpenSanctions",
-            "dataset": DATASET,
-            "dataset_url": DATASET_URL,
-            "license": "CC BY-NC 4.0",
-            "license_url": LICENSE_URL,
-            "version": index["version"],
-            "updated_at": str(index["updated_at"]),
-            "last_change": str(index["last_change"]),
-            "imported_at": datetime.now(UTC).isoformat(),
-            "companies": str(imported),
-            "records_scanned": str(seen),
-            "invalid_lines": str(invalid),
+        if scanned != index["entity_count"]:
+            raise RuntimeError(f"FTM stream неполный: ожидалось {index['entity_count']}, получено {scanned}")
+        return {
+            "imported": imported,
+            "synced_companies": count_synced_companies(connection, version),
+            "scanned": scanned,
+            "invalid_lines": invalid,
+            "stream_bytes": stream_bytes,
         }
-        connection.executemany("INSERT INTO metadata(key, value) VALUES (?, ?)", metadata.items())
-        connection.commit()
-        connection.execute("PRAGMA optimize")
-        write_status(state="validating", version=index["version"], imported=imported, scanned=seen)
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()
-        if not integrity or integrity[0] != "ok":
-            raise RuntimeError("SQLite staging database integrity check failed")
-        connection.close()
-        connection = None
-        result = {"state": "ready_to_publish", "version": index["version"], "imported": imported,
-                  "scanned": seen, "expected_entities": expected_entities, "invalid_lines": invalid,
-                  "updated_at": index["updated_at"], "last_change": index["last_change"]}
-        write_status(**result)
-        staging_ready = True
-        return result
     except Exception as error:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -334,14 +402,186 @@ def _import_snapshot_locked(expected_version: str | None = None) -> dict:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
-        write_status(state="failed", version=index["version"], imported=imported, scanned=seen,
-                     invalid_lines=invalid, error=f"{type(error).__name__}: {error}")
+        if pending:
+            try:
+                imported += insert_batch(connection, pending, version)
+                pending.clear()
+            except sqlite3.DatabaseError:
+                connection.rollback()
+        error.attempt_imported = imported
+        error.attempt_scanned = scanned
+        error.attempt_invalid_lines = invalid
+        raise
+
+
+def _import_snapshot_locked(expected_version: str | None = None) -> dict:
+    DATABASE.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC).isoformat()
+    write_status(state="checking", version=expected_version, imported=0, synced_companies=0,
+                 scanned=0, invalid_lines=0, error=None, started_at=started_at)
+    try:
+        if shutil.disk_usage(DATABASE.parent).free < MIN_FREE_BYTES:
+            raise RuntimeError("Меньше 4 ГБ свободно; импорт остановлен до скачивания")
+        if expected_version is not None and not re.fullmatch(r"[0-9]{14}-[a-z0-9]+", expected_version):
+            raise ValueError("Requested OpenSanctions version is invalid")
+        index = fetch_index()
+        if expected_version is not None and index["version"] != expected_version:
+            raise RuntimeError("OpenSanctions snapshot changed after version check; run the version check again")
+    except Exception as error:
+        write_status(state="failed", version=expected_version, imported=0, scanned=0,
+                     error=f"{type(error).__name__}: {error}")
+        raise
+
+    connection = None
+    total_imported = 0
+    last_attempt = {"scanned": 0, "invalid_lines": 0}
+    version = index["version"]
+    try:
+        connection = ensure_live_database(DATABASE)
+        synced = count_synced_companies(connection, version)
+        update_metadata(connection, {
+            "source": "OpenSanctions",
+            "dataset": DATASET,
+            "dataset_url": DATASET_URL,
+            "license": "CC BY-NC 4.0",
+            "license_url": LICENSE_URL,
+            "sync_state": "running",
+            "pending_version": version,
+            "sync_started_at": started_at,
+            "sync_attempt": "0",
+            "sync_scanned": "0",
+            "sync_companies": str(synced),
+            "sync_invalid_lines": "0",
+            "sync_error": "",
+        })
+
+        successful_attempt = None
+        for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                successful_attempt = download_attempt(
+                    connection, index, attempt, total_imported, synced, started_at,
+                )
+                total_imported += successful_attempt["imported"]
+                synced = successful_attempt["synced_companies"]
+                last_attempt = successful_attempt
+                break
+            except RetryableImportError as error:
+                total_imported += getattr(error, "attempt_imported", 0)
+                synced = count_synced_companies(connection, version)
+                last_attempt = {
+                    "scanned": getattr(error, "attempt_scanned", 0),
+                    "invalid_lines": getattr(error, "attempt_invalid_lines", 0),
+                }
+                if attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                    raise
+                delay = RETRY_BACKOFF_SECONDS[attempt - 1]
+                retry_at = (datetime.now(UTC).timestamp() + delay)
+                update_metadata(connection, {
+                    "sync_state": "retrying",
+                    "pending_version": version,
+                    "sync_attempt": str(attempt),
+                    "sync_scanned": str(last_attempt["scanned"]),
+                    "sync_companies": str(synced),
+                    "sync_invalid_lines": str(last_attempt["invalid_lines"]),
+                    "sync_error": str(error),
+                })
+                write_status(
+                    state="retrying", version=version, source_updated_at=index["updated_at"],
+                    last_source_change=index["last_change"], expected_bytes=index["resource_size"],
+                    expected_entities=index["entity_count"], attempt=attempt,
+                    max_attempts=MAX_DOWNLOAD_ATTEMPTS, retry_in_seconds=delay,
+                    retry_at=datetime.fromtimestamp(retry_at, UTC).isoformat(),
+                    imported=total_imported, synced_companies=synced,
+                    scanned=last_attempt["scanned"], invalid_lines=last_attempt["invalid_lines"],
+                    error=str(error), started_at=started_at,
+                )
+                time.sleep(delay)
+
+        if successful_attempt is None:
+            raise RetryableImportError("Все попытки загрузки исчерпаны")
+        scanned = successful_attempt["scanned"]
+        invalid = successful_attempt["invalid_lines"]
+        expected_entities = index["entity_count"]
+        if synced == 0:
+            raise RuntimeError("В FTM snapshot не найдено ни одной Company с валидным ИНН")
+        write_status(state="validating", version=version, attempt=attempt,
+                     max_attempts=MAX_DOWNLOAD_ATTEMPTS, imported=total_imported,
+                     synced_companies=synced, scanned=scanned, invalid_lines=invalid, error=None)
+
+        metadata = {
+            "source": "OpenSanctions",
+            "dataset": DATASET,
+            "dataset_url": DATASET_URL,
+            "license": "CC BY-NC 4.0",
+            "license_url": LICENSE_URL,
+            "version": version,
+            "updated_at": str(index["updated_at"]),
+            "last_change": str(index["last_change"]),
+            "imported_at": datetime.now(UTC).isoformat(),
+            "companies": str(synced),
+            "records_scanned": str(scanned),
+            "invalid_lines": str(invalid),
+            "sync_state": "complete",
+            "pending_version": "",
+            "sync_started_at": started_at,
+            "sync_attempt": str(attempt),
+            "sync_scanned": str(scanned),
+            "sync_companies": str(synced),
+            "sync_invalid_lines": "0",
+            "sync_error": "",
+        }
+        connection.executemany(
+            "INSERT INTO metadata(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            metadata.items(),
+        )
+        connection.execute("DELETE FROM companies WHERE last_seen_version != ?", (version,))
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise RuntimeError("SQLite live database integrity check failed")
+        connection.commit()
+        connection.execute("PRAGMA optimize")
+        connection.commit()
+        result = {
+            "state": "complete", "version": version, "attempt": attempt,
+            "imported": total_imported, "synced_companies": synced,
+            "scanned": scanned, "expected_entities": expected_entities,
+            "invalid_lines": invalid, "updated_at": index["updated_at"],
+            "last_change": index["last_change"], "published": True,
+        }
+        write_status(**result)
+        return result
+    except Exception as error:
+        try:
+            connection.rollback()
+        except (sqlite3.DatabaseError, AttributeError):
+            pass
+        try:
+            synced = count_synced_companies(connection, version)
+            interrupted = isinstance(error, (ImportStopRequested, RetryableImportError))
+            update_metadata(connection, {
+                "sync_state": "interrupted",
+                "pending_version": version,
+                "sync_scanned": str(last_attempt["scanned"]),
+                "sync_companies": str(synced),
+                "sync_invalid_lines": str(last_attempt["invalid_lines"]),
+                "sync_error": f"{type(error).__name__}: {error}",
+            })
+        except (sqlite3.DatabaseError, AttributeError):
+            synced = 0
+            connection.rollback()
+            interrupted = isinstance(error, (ImportStopRequested, RetryableImportError))
+        state = "interrupted" if interrupted else "failed"
+        write_status(
+            state=state, version=version, attempt=attempt if "attempt" in locals() else 0,
+            max_attempts=MAX_DOWNLOAD_ATTEMPTS, retry_in_seconds=0,
+            synced_companies=synced, scanned=last_attempt["scanned"],
+            invalid_lines=last_attempt["invalid_lines"], error=f"{type(error).__name__}: {error}",
+        )
         raise
     finally:
         if connection is not None:
             connection.close()
-        if not staging_ready:
-            staging.unlink(missing_ok=True)
 
 
 def import_snapshot(expected_version: str | None = None) -> dict:
@@ -396,10 +636,17 @@ def publish_snapshot(database: Path = DATABASE, status_file: Path = STATUS_FILE)
         return result
 
 
+def handle_stop_signal(signum, frame):
+    raise ImportStopRequested("Импорт остановлен вручную; синхронизированные batches сохранены")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--expected-version")
     arguments = parser.parse_args()
+
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
     try:
         result = import_snapshot(arguments.expected_version)
         print(json.dumps(result, ensure_ascii=False))

@@ -94,8 +94,10 @@ svg { width: 20px; height: 20px; flex: none; stroke-width: 1.8; }
 .header-actions { display: flex; align-items: center; gap: 14px; }
 .icon-button { width: 44px; height: 44px; flex: none; display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); padding: 0; }
 .icon-button:hover { background: var(--green-light); }
-.settings-dialog { width: min(540px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; margin: auto; padding: 24px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); }
+.settings-dialog { width: min(1120px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; margin: auto; padding: 24px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); }
 .settings-dialog::backdrop { background: var(--backdrop); }
+.settings-columns { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.settings-column { min-width: 0; }
 .access-denied-dialog { width: min(560px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; margin: auto; padding: 20px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--surface); }
 .access-denied-dialog::backdrop { background: var(--backdrop); }
 .access-denied-content { display: flex; flex-direction: column; align-items: center; gap: 16px; }
@@ -110,6 +112,8 @@ svg { width: 20px; height: 20px; flex: none; stroke-width: 1.8; }
 .wireguard-description { margin: 6px 0 12px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
 .wireguard-settings .toggle-label { margin: 12px 0 4px; }
 .wireguard-status { margin: 4px 0 0; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
+.wireguard-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.wireguard-actions .button { min-width: 0; min-height: 40px; gap: 6px; padding: 8px; font-size: 13px; white-space: normal; }
 .opensanctions-settings { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
 .opensanctions-settings h3 { margin: 0; font-size: 18px; font-weight: 600; }
 .opensanctions-status, .opensanctions-details, .opensanctions-message { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -119,6 +123,17 @@ svg { width: 20px; height: 20px; flex: none; stroke-width: 1.8; }
 .opensanctions-actions .button { flex: 1 1 130px; font-size: 14px; padding-inline: 10px; }
 .opensanctions-message.error, .opensanctions-status.error { color: var(--red); }
 .opensanctions-publish { margin-top: 14px; }
+.settings-column-data .opensanctions-settings { margin-top: 0; padding-top: 0; border-top: 0; }
+.archive-settings { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.archive-heading h4 { margin: 0; font-size: 16px; font-weight: 600; }
+.archive-status, .archive-details, .archive-message { margin: 6px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.archive-status.error, .archive-message.error { color: var(--red); }
+.archive-progress { display: block; width: 100%; height: 10px; margin: 10px 0 4px; accent-color: var(--green); }
+.archive-progress[hidden] { display: none; }
+.archive-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.archive-actions .button { flex: 1 1 160px; min-width: 0; min-height: 42px; padding-inline: 10px; font-size: 13px; white-space: normal; }
+.archive-actions [hidden] { display: none; }
+.partial-sync-warning { display: block; margin-top: 6px; color: var(--yellow); }
 .settings-dialog input[type="password"] { width: 100%; }
 .toggle-label { display: flex; align-items: center; gap: 10px; margin-block: 18px; color: var(--ink); }
 .toggle-label input { width: 20px; height: 20px; min-height: 20px; padding: 0; margin: 0; accent-color: var(--green); }
@@ -223,6 +238,12 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .field-row { grid-template-columns: 180px minmax(0, 1fr) 130px; }
 }
 
+@media (min-width: 1001px) {
+  .settings-dialog { overflow-y: hidden; }
+  .settings-columns { grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 28px; }
+  .settings-column-primary .wireguard-settings { margin-top: 18px; padding-top: 16px; }
+}
+
 @media (max-width: 600px) {
   .container { width: calc(100% - 32px); }
   .header-inner { min-height: 84px; gap: 12px; flex-wrap: wrap; padding-block: 14px; }
@@ -231,10 +252,12 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .source-label { font-size: 16px; }
   .header-actions { width: 100%; justify-content: space-between; }
   .settings-dialog { padding: 18px; }
+  .settings-dialog { overflow-y: auto; }
   .settings-state, .security-warning, .settings-actions .button { font-size: 16px; }
   .settings-actions { grid-template-columns: minmax(0, 1fr) 44px; }
   .settings-actions .button { grid-column: 1 / -1; }
   .settings-actions .delete-key { grid-column: 2; }
+  .wireguard-actions { grid-template-columns: minmax(0, 1fr); }
   .search-section { padding-top: 24px; }
   h1 { font-size: 24px; }
   .search-controls { grid-template-columns: minmax(0, 1fr); }

@@ -1,0 +1,28 @@
+[Unit]
+Description=FNSRUS OpenSanctions full archive download and PostgreSQL import (%i)
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+
+[Service]
+Type=exec
+User=deploy
+Group=www-data
+WorkingDirectory=/srv/mcp-fns
+Environment=HOME=/home/deploy
+Environment=FNS_OPENSANCTIONS_ARCHIVE_DIR=/var/lib/mcp-fns/archives/opensanctions
+Environment=FNS_OPENSANCTIONS_ARCHIVE_STATUS=/var/lib/mcp-fns/opensanctions-archive-status.json
+Environment=FNS_OPENSANCTIONS_POSTGRES_DSN=dbname=fnsrus user=deploy host=/var/run/postgresql
+EnvironmentFile=-/etc/mcp-fns.env
+ExecStart=/srv/mcp-fns/.venv/bin/python /srv/mcp-fns/scripts/download_opensanctions_archive.py --expected-version %i
+TimeoutStartSec=30
+RuntimeMaxSec=infinity
+TimeoutStopSec=180
+UMask=0027
+MemoryMax=512M
+CPUQuota=80%
+TasksMax=64
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/mcp-fns

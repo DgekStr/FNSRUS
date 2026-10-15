@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
-  <link rel="stylesheet" href="/static/style.css?v=9">
+  <link rel="stylesheet" href="/static/style.css?v=13">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=13"></script>
+  <script type="module" src="/static/app.js?v=20"></script>
 </head>
 <body>
   <header class="site-header">
@@ -80,6 +80,8 @@
 
   <dialog id="api-settings" class="settings-dialog" aria-labelledby="settings-heading">
     <div class="settings-heading"><h2 id="settings-heading">Настройки API</h2><button id="settings-close" class="icon-button" type="button" title="Закрыть настройки" aria-label="Закрыть настройки"><i data-lucide="x" aria-hidden="true"></i></button></div>
+    <div class="settings-columns">
+      <div class="settings-column settings-column-primary">
     <form id="settings-form" autocomplete="off">
       <div id="settings-state" class="settings-state" role="status">Загрузка…</div>
       <div id="settings-security" class="security-warning" hidden>Соединение без HTTPS. Вводите ключ только в доверенной локальной сети.</div>
@@ -92,10 +94,17 @@
     <section class="wireguard-settings" aria-labelledby="wireguard-heading">
       <h3 id="wireguard-heading">WireGuard</h3>
       <p class="wireguard-description">Туннель используется только для доступа к proxy OpenSanctions. Остальной трафик сервера не перенаправляется.</p>
-      <label class="toggle-label" for="wireguard-enabled"><input id="wireguard-enabled" type="checkbox" disabled><span>Подключение активно</span></label>
+      <label class="toggle-label" for="wireguard-autostart"><input id="wireguard-autostart" type="checkbox" disabled><span>Автозапуск при старте системы</span></label>
       <p id="wireguard-status" class="wireguard-status" role="status" aria-live="polite">Проверяем состояние туннеля…</p>
+      <div class="wireguard-actions">
+        <button id="wireguard-save" class="button button-secondary" type="button" disabled><i data-lucide="save" aria-hidden="true"></i><span>Сохранить</span></button>
+        <button id="wireguard-enable" class="button button-primary" type="button" disabled><i data-lucide="power" aria-hidden="true"></i><span>Включить</span></button>
+        <button id="wireguard-disable" class="button button-secondary" type="button" disabled><i data-lucide="power-off" aria-hidden="true"></i><span>Выключить</span></button>
+      </div>
       <div id="wireguard-message" class="form-message" role="status" aria-live="polite"></div>
     </section>
+      </div>
+      <div class="settings-column settings-column-data">
     <section class="opensanctions-settings" aria-labelledby="opensanctions-heading">
       <h3 id="opensanctions-heading">OpenSanctions ru_egrul</h3>
       <p id="opensanctions-status" class="opensanctions-status" role="status" aria-live="polite">Проверяем импорт…</p>
@@ -106,11 +115,30 @@
       <div class="opensanctions-actions">
         <button id="opensanctions-check" class="button button-secondary" type="button" disabled><i data-lucide="refresh-cw" aria-hidden="true"></i><span>Сверить версии</span></button>
         <button id="opensanctions-start" class="button button-primary" type="button" hidden disabled><i data-lucide="download" aria-hidden="true"></i><span id="opensanctions-start-label">Запустить импорт</span></button>
+        <button id="opensanctions-stop" class="button button-secondary" type="button" hidden disabled><i data-lucide="square" aria-hidden="true"></i><span>Остановить импорт</span></button>
       </div>
       <p id="opensanctions-update-status" class="opensanctions-details" role="status" aria-live="polite"></p>
       <button id="opensanctions-publish" class="button button-primary opensanctions-publish" type="button" hidden><i data-lucide="database" aria-hidden="true"></i><span>Опубликовать базу</span></button>
       <p id="opensanctions-message" class="opensanctions-message" role="status" aria-live="polite"></p>
+      <section class="archive-settings" aria-labelledby="archive-heading">
+        <div class="archive-heading"><h4 id="archive-heading">Полный архив</h4></div>
+        <p id="archive-status" class="archive-status" role="status" aria-live="polite">Проверяем состояние архива…</p>
+        <p id="archive-target" class="archive-details"></p>
+        <p id="archive-storage" class="archive-details"></p>
+        <p id="archive-postgres" class="archive-details"></p>
+        <progress id="archive-progress" class="archive-progress" max="100" value="0" aria-label="Прогресс архива" hidden></progress>
+        <p id="archive-progress-label" class="archive-details"></p>
+        <div class="archive-actions">
+          <button id="archive-preflight" class="button button-secondary" type="button" disabled><i data-lucide="hard-drive" aria-hidden="true"></i><span>Проверить место</span></button>
+          <button id="archive-start" class="button button-primary" type="button" hidden disabled><i data-lucide="download" aria-hidden="true"></i><span>Скачать полный архив</span></button>
+          <button id="archive-stop" class="button button-secondary" type="button" hidden disabled><i data-lucide="square" aria-hidden="true"></i><span>Остановить</span></button>
+        </div>
+        <p id="archive-preflight-status" class="archive-details" role="status" aria-live="polite"></p>
+        <p id="archive-message" class="archive-message" role="status" aria-live="polite"></p>
+      </section>
     </section>
+      </div>
+    </div>
   </dialog>
   <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a> · <span class="footer-version">Версия 1.2</span></p></div></footer>
   <dialog id="settings-access-denied" class="access-denied-dialog" aria-labelledby="settings-access-denied-message">
