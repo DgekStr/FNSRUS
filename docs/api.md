@@ -159,6 +159,7 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 ## Настройки API-ФНС
 
 - `GET /api/settings/wireguard`: статус конфигурации, активного соединения, handshake и systemd autostart.
+- `POST /api/settings/wireguard/config`: импортировать или сохранить конфигурацию клиента из текста `.conf`.
 - `POST /api/settings/wireguard/action`: `{"action":"save","enabled":true|false}` сохраняет только автозапуск; `{"action":"enable"}` запускает WG сейчас, `{"action":"disable"}` останавливает WG сейчас. Runtime-действия не меняют autostart.
 - `POST /api/settings/wireguard`: legacy-команда; `enabled:true/false` одновременно меняет autostart и состояние соединения.
 - `GET /api/settings/api-fns`: только `configured`, `enabled`, `verified_at`, `methods`;
@@ -176,6 +177,17 @@ curl -s http://192.168.0.45/api/tools/get_legal_status \
 - `POST /api/settings/opensanctions/archive/start`: запустить скачивание и PostgreSQL-импорт указанной версии.
 - `POST /api/settings/opensanctions/archive/stop`: остановить только archive unit указанной версии.
 - `POST /api/settings/opensanctions/publish`: legacy endpoint для готовой staging-базы. Новые импорты пишутся в live-БД сразу.
+
+Для `POST /api/settings/wireguard/config` передавайте `{"config":"[Interface]..."}`.
+Разрешены только `Interface` (`PrivateKey`, `Address`, `MTU`, `Table=off`) и `Peer`
+(`PublicKey`, `PresharedKey`, `AllowedIPs`, `Endpoint`, `PersistentKeepalive`);
+`Address` фиксирован на `10.8.0.5/32`, `AllowedIPs` — только `10.8.0.1/32`, чтобы
+WG не менял default route или DNS сервера. Неизвестные директивы, включая DNS и
+shell hooks и любые `Table`, кроме `off`, отклоняются. В `GET /api/settings/wireguard` секреты заменяются на
+`__KEEP_EXISTING__`; этот маркер при сохранении оставляет текущие ключи. Файл
+заменяется атомарно с правами 0600. Сохранение не перезапускает активное соединение;
+ответ содержит `restart_required`, если новые параметры применятся при следующем
+подключении. Импорт и проверка файла сами по себе WG не переключают.
 
 ### Полный архив и PostgreSQL
 

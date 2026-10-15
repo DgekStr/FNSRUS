@@ -6,9 +6,9 @@
   <meta name="theme-color" content="#176b50">
   <title>ФНС РУС — Проверка контрагента</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=1">
-  <link rel="stylesheet" href="/static/style.css?v=13">
+  <link rel="stylesheet" href="/static/style.css?v=15">
   <script src="/static/vendor/lucide.min.js" defer></script>
-  <script type="module" src="/static/app.js?v=20"></script>
+  <script type="module" src="/static/app.js?v=22"></script>
 </head>
 <body>
   <header class="site-header">
@@ -102,6 +102,20 @@
         <button id="wireguard-disable" class="button button-secondary" type="button" disabled><i data-lucide="power-off" aria-hidden="true"></i><span>Выключить</span></button>
       </div>
       <div id="wireguard-message" class="form-message" role="status" aria-live="polite"></div>
+      <details class="wireguard-config">
+        <summary>Импорт или изменение конфигурации</summary>
+        <div class="wireguard-config-body">
+          <div class="wireguard-config-actions">
+            <button id="wireguard-config-import" class="button button-secondary" type="button" disabled><i data-lucide="upload" aria-hidden="true"></i><span>Импортировать .conf</span></button>
+            <input id="wireguard-config-file" class="wireguard-file-input" type="file" accept=".conf,text/plain" disabled>
+            <button id="wireguard-config-save" class="button button-primary" type="button" disabled><i data-lucide="save" aria-hidden="true"></i><span>Сохранить конфигурацию</span></button>
+          </div>
+          <label for="wireguard-config-editor">Конфигурация WireGuard</label>
+          <textarea id="wireguard-config-editor" class="wireguard-config-editor" maxlength="16384" spellcheck="false" autocapitalize="none" disabled></textarea>
+          <p class="wireguard-config-hint">Секретные ключи скрыты. Оставьте __KEEP_EXISTING__ без изменений, чтобы сохранить текущие ключи. Сохранение не перезапускает активный туннель.</p>
+          <p id="wireguard-config-message" class="form-message" role="status" aria-live="polite"></p>
+        </div>
+      </details>
     </section>
       </div>
       <div class="settings-column settings-column-data">
@@ -140,7 +154,7 @@
       </div>
     </div>
   </dialog>
-  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a> · <span class="footer-version">Версия 1.2</span></p></div></footer>
+  <footer class="site-footer"><div class="container footer-inner"><span>ФНС РУС</span><p>Сведения из открытых источников. Не является официальной выпиской ФНС или юридическим заключением. <a href="https://focuslens.dev" target="_blank" rel="noopener noreferrer">©FOCUSLENS.DEV</a> · <span class="footer-version">Версия 1.3</span></p></div></footer>
   <dialog id="settings-access-denied" class="access-denied-dialog" aria-labelledby="settings-access-denied-message">
     <div class="access-denied-content">
       <img class="access-denied-image" src="/static/you-didnt-say-the-magic-word-ah-ah.gif" alt="Анимированная картинка: «Ах-ах-ах!»" width="498" height="420">

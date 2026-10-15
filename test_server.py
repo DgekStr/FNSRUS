@@ -69,7 +69,7 @@ class APITests(unittest.TestCase):
         self.client = TestClient(server.app, client=("192.168.0.10", 12345))
 
     def test_release_version(self):
-        self.assertEqual(server.APP_VERSION, "1.2")
+        self.assertEqual(server.APP_VERSION, "1.3")
         self.assertEqual(server.app.version, server.APP_VERSION)
 
     def test_scoped_opensanctions_proxy_config(self):
@@ -454,8 +454,9 @@ class APITests(unittest.TestCase):
         index = {"version": "20261012190838-iez", "resource_size": 1000, "resource_checksum": "a" * 40}
         with tempfile.TemporaryDirectory() as directory, \
                 patch.object(opensanctions_archive.shutil, "disk_usage", return_value=SimpleNamespace(free=9_000)):
+            archive_dir = Path(directory) if os.name == "nt" else Path("/var/lib/mcp-fns/archive-preflight-test")
             plan = opensanctions_archive.archive_preflight(
-                index, Path(directory), postgres_reserve_bytes=2_000,
+                index, archive_dir, postgres_reserve_bytes=2_000,
             )
         self.assertEqual(plan["archive_size_bytes"], 1000)
         self.assertEqual(plan["required_free_bytes"], 1000 + opensanctions_archive.MIN_FREE_BYTES + 2000)
@@ -1344,6 +1345,7 @@ class APITests(unittest.TestCase):
         self.assertEqual(self.client.delete("/api/settings/api-fns", headers=headers).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/opensanctions/publish", headers=headers, json={}).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/opensanctions/import", headers=headers, json={"expected_version": "20261014190000-new"}).status_code, 403)
+        self.assertEqual(self.client.post("/api/settings/wireguard/config", headers=headers, json={"config": "[Interface]"}).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/wireguard/action", headers=headers, json={"action": "enable"}).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/opensanctions/stop", headers=headers, json={"expected_version": "20261014190000-new"}).status_code, 403)
         self.assertEqual(self.client.post("/api/settings/opensanctions/stop", headers=headers, json={"expected_version": "20261014190000-new"}).status_code, 403)
@@ -1373,6 +1375,7 @@ class APITests(unittest.TestCase):
             ("GET", "/api/settings/wireguard", {}),
             ("POST", "/api/settings/wireguard", {"json": {"enabled": True}}),
             ("POST", "/api/settings/wireguard/action", {"json": {"action": "enable"}}),
+            ("POST", "/api/settings/wireguard/config", {"json": {"config": "[Interface]"}}),
             ("GET", "/api/settings/opensanctions", {}),
             ("GET", "/api/settings/opensanctions/update-check", {}),
             ("POST", "/api/settings/opensanctions/import", {"json": {"expected_version": "20261014190000-new"}}),
@@ -1469,6 +1472,136 @@ class APITests(unittest.TestCase):
         for command, enabled, expected in scenarios:
             self.assertTrue(helper["handle"](command, enabled)["ok"])
             self.assertEqual(calls[-1], expected)
+
+    def test_wireguard_config_api_delegates_to_root_helper(self):
+        config = "[Interface]\nAddress = 10.8.0.5/32\n"
+        saved = {
+            "ok": True, "configured": True, "enabled": True, "active": True,
+            "handshake": True, "config_saved": True, "restart_required": True,
+            "config_text": "[Interface]\nPrivateKey = __KEEP_EXISTING__\n",
+        }
+        with patch.object(server, "wireguard_control", return_value=saved) as control:
+            response = self.client.post(
+                "/api/settings/wireguard/config",
+                headers={"x-fns-settings": "1", "content-type": "application/json"},
+                json={"config": config},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["restart_required"])
+        control.assert_called_once_with("save_config", None, config)
+
+    def test_wireguard_root_helper_config_edit_preserves_masked_keys(self):
+        helper = runpy.run_path(str(Path(server.BASE_DIR) / "scripts" / "fnsrus-wg-control.py"))
+        helper_globals = helper["handle"].__globals__
+        private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        public_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+        preshared_key = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        original = (
+            "[Interface]\nPrivateKey = " + private_key + "\nAddress = 10.8.0.5/32\nMTU = 1420\nTable = off\n\n"
+            "[Peer]\nPublicKey = " + public_key + "\nPresharedKey = " + preshared_key + "\n"
+            "AllowedIPs = 10.8.0.1/32\nPersistentKeepalive = 25\nEndpoint = 192.168.0.39:51820\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "fnsrus.conf"
+            config_path.write_text(original, encoding="ascii")
+            helper_globals["CONFIG"] = config_path
+            helper_globals["systemd_state"] = lambda *_args: True
+            helper_globals["systemctl"] = lambda *_args: self.fail("config save must not invoke systemctl")
+            preview = helper_globals["status"]()["config_text"]
+            self.assertNotIn(private_key, preview)
+            self.assertNotIn(preshared_key, preview)
+            self.assertIn(public_key, preview)
+            self.assertEqual(preview.count(helper_globals["PRESERVE_SECRET"]), 2)
+            edited = preview.replace("Endpoint = 192.168.0.39:51820", "Endpoint = 192.0.2.5:51821")
+            handshake = f"peer\t{int(helper_globals['time'].time())}\n"
+            with patch.object(helper_globals["subprocess"], "check_output", return_value=handshake):
+                result = helper_globals["handle"]("save_config", config_text=edited)
+            saved_config = config_path.read_text(encoding="ascii")
+            self.assertTrue(result["config_saved"])
+            self.assertTrue(result["restart_required"])
+            self.assertTrue(result["active"])
+            self.assertIn(f"PrivateKey = {private_key}", saved_config)
+            self.assertIn(f"PresharedKey = {preshared_key}", saved_config)
+            self.assertIn("Endpoint = 192.0.2.5:51821", saved_config)
+            self.assertNotIn(helper_globals["PRESERVE_SECRET"], saved_config)
+            if os.name != "nt":
+                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_wireguard_root_helper_imports_first_config_without_starting_tunnel(self):
+        helper = runpy.run_path(str(Path(server.BASE_DIR) / "scripts" / "fnsrus-wg-control.py"))
+        helper_globals = helper["handle"].__globals__
+        private_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        public_key = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+        config = (
+            f"[Interface]\nPrivateKey = {private_key}\nAddress = 10.8.0.5/32\n\n"
+            f"[Peer]\nPublicKey = {public_key}\nAllowedIPs = 10.8.0.1/32\n"
+            "Endpoint = 192.0.2.5:51820\nPersistentKeepalive = 25\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "fnsrus.conf"
+            helper_globals["CONFIG"] = config_path
+            helper_globals["systemd_state"] = lambda *_args: False
+            helper_globals["systemctl"] = lambda *_args: self.fail("config import must not change runtime")
+            result = helper["handle"]("save_config", config_text=config)
+            self.assertTrue(result["config_saved"])
+            self.assertFalse(result["configured"] is False)
+            self.assertFalse(result["active"])
+            self.assertFalse(result["restart_required"])
+            self.assertTrue(config_path.is_file())
+            if os.name != "nt":
+                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_wireguard_root_helper_imports_first_config_without_starting_tunnel(self):
+        helper = runpy.run_path(str(Path(server.BASE_DIR) / "scripts" / "fnsrus-wg-control.py"))
+        helper_globals = helper["handle"].__globals__
+        config = (
+            "[Interface]\nPrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "Address = 10.8.0.5/32\n\n[Peer]\n"
+            "PublicKey = AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=\n"
+            "AllowedIPs = 10.8.0.1/32\nEndpoint = 192.0.2.5:51820\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "fnsrus.conf"
+            helper_globals["CONFIG"] = config_path
+            helper_globals["systemd_state"] = lambda *_args: False
+            helper_globals["systemctl"] = lambda *_args: self.fail("config import must not change runtime")
+            result = helper["handle"]("save_config", config_text=config)
+            self.assertTrue(result["config_saved"])
+            self.assertTrue(result["configured"])
+            self.assertFalse(result["active"])
+            self.assertFalse(result["restart_required"])
+            self.assertTrue(config_path.is_file())
+            if os.name != "nt":
+                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+
+    def test_wireguard_root_helper_rejects_root_hook_directives(self):
+        helper = runpy.run_path(str(Path(server.BASE_DIR) / "scripts" / "fnsrus-wg-control.py"))
+        unsafe = (
+            "[Interface]\nPrivateKey = __KEEP_EXISTING__\nAddress = 10.8.0.5/32\n"
+            "PostUp = touch /tmp/wg-hook\n\n[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "AllowedIPs = 10.8.0.1/32\nEndpoint = 192.0.2.5:51820\n"
+        )
+        with self.assertRaises(helper["ConfigError"]):
+            helper["parse_config"](unsafe)
+
+    def test_wireguard_root_helper_rejects_broad_routes_and_dns(self):
+        helper = runpy.run_path(str(Path(server.BASE_DIR) / "scripts" / "fnsrus-wg-control.py"))
+        config = (
+            "[Interface]\nPrivateKey = __KEEP_EXISTING__\nAddress = 10.8.0.5/32\n\n"
+            "[Peer]\nPublicKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"
+            "PresharedKey = __KEEP_EXISTING__\nAllowedIPs = 10.8.0.1/32\n"
+            "Endpoint = 192.0.2.5:51820\n"
+        )
+        sections = helper["parse_config"](config)
+        helper["validate_config"](sections)
+        for unsafe in (
+            config.replace("AllowedIPs = 10.8.0.1/32", "AllowedIPs = 0.0.0.0/0"),
+            config.replace("Address = 10.8.0.5/32", "Address = 10.8.0.6/32"),
+            config.replace("[Peer]", "DNS = 1.1.1.1\n\n[Peer]"),
+            config.replace("AllowedIPs = 10.8.0.1/32", "AllowedIPs = 10.8.0.1/32\nTable = 100"),
+        ):
+            with self.subTest(config=unsafe), self.assertRaises(helper["ConfigError"]):
+                helper["validate_config"](helper["parse_config"](unsafe))
 
     def test_invalid_key_replacement_preserves_saved_key(self):
         api_fns.save_settings({"api_key": "original-fake-key", "enabled": True})

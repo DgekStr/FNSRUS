@@ -148,7 +148,7 @@ runuser -u deploy -- psql 'dbname=fnsrus user=deploy host=/var/run/postgresql' -
 
 ```bash
 install -m 0644 systemd/fnsrus-opensanctions-archive@.service /etc/systemd/system/fnsrus-opensanctions-archive@.service
-systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
+systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service systemd/fnsrus-wg-control@.service
 systemctl daemon-reload
 ```
 
@@ -199,13 +199,15 @@ Nginx работает от www-data и читает статику по пра�
 
 ```bash
 cd /srv/mcp-fns
-systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service
+systemd-analyze verify systemd/mcp-fns-ui.service systemd/fnsrus-opensanctions-import@.service systemd/fnsrus-opensanctions-archive@.service systemd/fnsrus-import-control.socket systemd/fnsrus-import-control@.service systemd/fnsrus-wg-control@.service
 install -m 0644 systemd/mcp-fns-ui.service /etc/systemd/system/mcp-fns-ui.service
 install -m 0644 systemd/fnsrus-opensanctions-import@.service /etc/systemd/system/fnsrus-opensanctions-import@.service
 install -m 0644 systemd/fnsrus-opensanctions-archive@.service /etc/systemd/system/fnsrus-opensanctions-archive@.service
 install -m 0644 systemd/fnsrus-import-control.socket /etc/systemd/system/fnsrus-import-control.socket
 install -m 0644 systemd/fnsrus-import-control@.service /etc/systemd/system/fnsrus-import-control@.service
 install -D -o root -g root -m 0755 scripts/fnsrus_import_control.py /usr/local/libexec/fnsrus-import-control
+install -m 0644 systemd/fnsrus-wg-control@.service /etc/systemd/system/fnsrus-wg-control@.service
+install -D -o root -g root -m 0755 scripts/fnsrus-wg-control.py /usr/local/libexec/fnsrus-wg-control
 systemctl daemon-reload
 systemctl enable --now fnsrus-import-control.socket
 systemctl enable --now mcp-fns-ui
@@ -216,6 +218,28 @@ the `deploy` user; the helper starts the version-scoped import unit as a
 separate systemd service so UI restarts cannot terminate a long import. The
 import unit is not enabled at boot and runs only after a checked version is
 requested from the LAN settings screen.
+
+`fnsrus-wg-control.socket` exposes narrow WireGuard status/config/runtime actions.
+Install its request unit and root helper together:
+
+```bash
+install -m 0644 systemd/fnsrus-wg-control@.service /etc/systemd/system/fnsrus-wg-control@.service
+install -D -o root -g root -m 0755 scripts/fnsrus-wg-control.py /usr/local/libexec/fnsrus-wg-control
+systemctl daemon-reload
+```
+
+The LAN editor accepts only the `Interface` and one `Peer`, keeps `Address` fixed
+at `10.8.0.5/32`, `AllowedIPs` at `10.8.0.1/32`, and `Table=off`, and rejects
+DNS/default-route and shell-hook directives. Private/Preshared keys are redacted in the status
+response; `__KEEP_EXISTING__` preserves them. Saving atomically replaces the
+mode-0600 file but does not restart an active tunnel. Reconnect deliberately after
+the current import task has finished to apply changed connection parameters.
+
+В настройках WireGuard можно импортировать `.conf` или изменить redacted preview.
+PrivateKey/PresharedKey заменяются маркерами, и `__KEEP_EXISTING__` сохраняет
+текущие секреты. Разрешён только proxy-маршрут `10.8.0.1/32`; default route и
+DNS сервера не меняются. Сохранение атомарно записывает файл 0600 и не перезапускает
+активный туннель; новые параметры применяются при следующем подключении.
 
 Если нужна отдельная конфигурация, скопируйте шаблон:
 

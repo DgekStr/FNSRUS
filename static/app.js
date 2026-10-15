@@ -501,6 +501,11 @@ const wireguardAutostart = document.getElementById("wireguard-autostart");
 const wireguardSave = document.getElementById("wireguard-save");
 const wireguardEnable = document.getElementById("wireguard-enable");
 const wireguardDisable = document.getElementById("wireguard-disable");
+const wireguardConfigFile = document.getElementById("wireguard-config-file");
+const wireguardConfigImport = document.getElementById("wireguard-config-import");
+const wireguardConfigEditor = document.getElementById("wireguard-config-editor");
+const wireguardConfigSave = document.getElementById("wireguard-config-save");
+const wireguardConfigMessage = document.getElementById("wireguard-config-message");
 const wireguardStatus = document.getElementById("wireguard-status");
 const wireguardMessage = document.getElementById("wireguard-message");
 const settingsAccessDialog = document.getElementById("settings-access-denied");
@@ -510,8 +515,9 @@ const apiEnabled = document.getElementById("api-enabled");
 const settingsMessage = document.getElementById("settings-message");
 let apiSettings = { configured: false, enabled: false };
 let settingsBusy = false;
-let wireguardState = { configured: false, enabled: false, active: false, handshake: false };
+let wireguardState = { configured: false, control_available: false, enabled: false, active: false, handshake: false };
 let wireguardBusy = false;
+let wireguardConfigDirty = false;
 const opensanctionsStatus = document.getElementById("opensanctions-status");
 const opensanctionsProgress = document.getElementById("opensanctions-progress");
 const opensanctionsProgressLabel = document.getElementById("opensanctions-progress-label");
@@ -593,10 +599,15 @@ async function wireguardRequest(method = "GET", body, suffix = "") {
   return data;
 }
 
-function showWireguardSettings(data) {
-  wireguardState = data;
+function showWireguardSettings(data, refreshConfig = false) {
+  wireguardState = { ...data, control_available: true };
   wireguardAutostart.checked = Boolean(data.enabled);
-  if (!data.configured) wireguardStatus.textContent = "Конфигурация WireGuard не установлена.";
+  if (refreshConfig || !wireguardConfigDirty) {
+    wireguardConfigEditor.value = data.config_text || "";
+    wireguardConfigDirty = false;
+  }
+  if (data.config_error) wireguardStatus.textContent = "Сохранённая конфигурация некорректна; импортируйте исправленный .conf.";
+  else if (!data.configured) wireguardStatus.textContent = "Конфигурация WireGuard не установлена.";
   else {
     const connection = data.active
       ? data.handshake ? `Подключён · proxy ${data.proxy}` : "Включён, ожидается handshake"
@@ -609,10 +620,16 @@ function showWireguardSettings(data) {
 
 function updateWireguardControls() {
   const available = !wireguardBusy && Boolean(wireguardState.configured);
+  const configAvailable = !wireguardBusy && Boolean(wireguardState.control_available);
   wireguardAutostart.disabled = !available;
-  wireguardSave.disabled = !available || wireguardAutostart.checked === Boolean(wireguardState.enabled);
-  wireguardEnable.disabled = !available || Boolean(wireguardState.active);
+  wireguardSave.disabled = !available || wireguardAutostart.checked === Boolean(wireguardState.enabled) ||
+    (Boolean(wireguardState.config_error) && wireguardAutostart.checked);
+  wireguardEnable.disabled = !available || Boolean(wireguardState.active) || Boolean(wireguardState.config_error);
   wireguardDisable.disabled = !available || !wireguardState.active;
+  wireguardConfigFile.disabled = !configAvailable;
+  wireguardConfigImport.disabled = !configAvailable;
+  wireguardConfigEditor.disabled = !configAvailable;
+  wireguardConfigSave.disabled = !configAvailable || !wireguardConfigDirty;
 }
 
 async function refreshWireguardSettings() {
@@ -621,11 +638,12 @@ async function refreshWireguardSettings() {
   wireguardMessage.textContent = "Проверяем состояние туннеля…";
   wireguardMessage.classList.remove("error");
   try {
-    showWireguardSettings(await wireguardRequest());
+    showWireguardSettings(await wireguardRequest(), true);
     wireguardMessage.textContent = "";
   } catch (error) {
     wireguardMessage.textContent = error.message;
     wireguardMessage.classList.add("error");
+    wireguardState.control_available = false;
   } finally {
     wireguardBusy = false;
     updateWireguardControls();
@@ -661,6 +679,62 @@ wireguardAutostart.addEventListener("change", updateWireguardControls);
 wireguardSave.addEventListener("click", () => void applyWireguardAction("save", wireguardAutostart.checked));
 wireguardEnable.addEventListener("click", () => void applyWireguardAction("enable"));
 wireguardDisable.addEventListener("click", () => void applyWireguardAction("disable"));
+
+wireguardConfigImport.addEventListener("click", () => wireguardConfigFile.click());
+wireguardConfigEditor.addEventListener("input", () => {
+  wireguardConfigDirty = true;
+  updateWireguardControls();
+});
+
+wireguardConfigFile.addEventListener("change", async () => {
+  const file = wireguardConfigFile.files?.[0];
+  wireguardConfigFile.value = "";
+  if (!file) return;
+  if (file.size > 16384) {
+    wireguardConfigMessage.textContent = "Файл превышает допустимый размер 16 КБ.";
+    wireguardConfigMessage.classList.add("error");
+    return;
+  }
+  try {
+    const text = await file.text();
+    if (new TextEncoder().encode(text).byteLength > 16384) throw new Error("Файл превышает допустимый размер 16 КБ.");
+    wireguardConfigEditor.value = text;
+    wireguardConfigDirty = true;
+    wireguardConfigMessage.textContent = "Файл загружен в редактор; проверьте конфигурацию и сохраните её.";
+    wireguardConfigMessage.classList.remove("error");
+    updateWireguardControls();
+  } catch (error) {
+    wireguardConfigMessage.textContent = error.message || "Не удалось прочитать файл конфигурации.";
+    wireguardConfigMessage.classList.add("error");
+  }
+});
+
+wireguardConfigSave.addEventListener("click", async () => {
+  if (wireguardBusy || !wireguardState.control_available || !wireguardConfigDirty) return;
+  if (new TextEncoder().encode(wireguardConfigEditor.value).byteLength > 16384) {
+    wireguardConfigMessage.textContent = "Конфигурация превышает допустимый размер 16 КБ.";
+    wireguardConfigMessage.classList.add("error");
+    return;
+  }
+  wireguardBusy = true;
+  updateWireguardControls();
+  wireguardConfigMessage.textContent = "Сохраняем конфигурацию…";
+  wireguardConfigMessage.classList.remove("error");
+  try {
+    const data = await wireguardRequest("POST", { config: wireguardConfigEditor.value }, "/config");
+    wireguardConfigDirty = false;
+    showWireguardSettings(data, true);
+    wireguardConfigMessage.textContent = data.restart_required
+      ? "Конфигурация сохранена. Активный туннель не прерван; новые параметры применятся при следующем подключении."
+      : "Конфигурация сохранена.";
+  } catch (error) {
+    wireguardConfigMessage.textContent = error.message;
+    wireguardConfigMessage.classList.add("error");
+  } finally {
+    wireguardBusy = false;
+    updateWireguardControls();
+  }
+});
 
 async function opensanctionsRequest(endpoint = "", method = "GET", body) {
   const response = await fetch(`/api/settings/opensanctions${endpoint}`, {

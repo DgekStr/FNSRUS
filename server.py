@@ -117,6 +117,11 @@ class WireGuardActionRequest(BaseModel):
     enabled: bool | None = Field(default=None, strict=True)
 
 
+class WireGuardConfigRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    config: str = Field(strict=True, min_length=1, max_length=16384)
+
+
 class OpenSanctionsImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: str = Field(strict=True, min_length=16, max_length=32)
@@ -660,8 +665,8 @@ async def call_search_by_name(query):
             raise APIError(503, "search_unavailable", SEARCH_UNAVAILABLE_MESSAGE) from error
 
 
-def wireguard_control(command, enabled=None):
-    if command not in {"status", "connect", "disconnect", "save", "enable", "disable"}:
+def wireguard_control(command, enabled=None, config_text=None):
+    if command not in {"status", "connect", "disconnect", "save", "enable", "disable", "save_config"}:
         raise ValueError("invalid WireGuard control command")
     if not hasattr(socket, "AF_UNIX"):
         raise APIError(503, "wireguard_control_unavailable", "Управление WireGuard временно недоступно.")
@@ -672,9 +677,11 @@ def wireguard_control(command, enabled=None):
             payload = {"command": command}
             if enabled is not None:
                 payload["enabled"] = enabled
-            client.sendall(json.dumps(payload).encode("utf-8") + b"\n")
-            response = client.makefile("rb").readline(4097)
-        if len(response) > 4096 or not response.endswith(b"\n"):
+            if config_text is not None:
+                payload["config"] = config_text
+            client.sendall(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+            response = client.makefile("rb").readline(65537)
+        if len(response) > 65536 or not response.endswith(b"\n"):
             raise ValueError("invalid WireGuard control response size")
         payload = json.loads(response)
         if not isinstance(payload, dict) or not isinstance(payload.get("ok"), bool):
@@ -847,6 +854,16 @@ async def apply_wireguard_action(body: WireGuardActionRequest):
         code = result.get("error", "wireguard_control_failed")
         status = 409 if code == "not_configured" else 503
         raise APIError(status, code, "Не удалось применить действие WireGuard.")
+    return result
+
+
+@app.post("/api/settings/wireguard/config")
+async def save_wireguard_config(body: WireGuardConfigRequest):
+    result = await asyncio.to_thread(wireguard_control, "save_config", None, body.config)
+    if not result["ok"]:
+        code = result.get("error", "wireguard_config_failed")
+        status = 422 if code == "invalid_config" else 503
+        raise APIError(status, code, "Не удалось сохранить конфигурацию WireGuard.")
     return result
 
 

@@ -12,5 +12,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadOnlyPaths=/etc/wireguard/fnsrus.conf
-ReadWritePaths=/run
+ReadWritePaths=/run /etc/wireguard

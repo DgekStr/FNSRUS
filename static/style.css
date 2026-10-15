@@ -114,6 +114,19 @@ svg { width: 20px; height: 20px; flex: none; stroke-width: 1.8; }
 .wireguard-status { margin: 4px 0 0; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
 .wireguard-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
 .wireguard-actions .button { min-width: 0; min-height: 40px; gap: 6px; padding: 8px; font-size: 13px; white-space: normal; }
+.wireguard-config { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.wireguard-config summary { cursor: pointer; color: var(--ink); font-size: 14px; font-weight: 600; }
+.wireguard-config-body { padding-top: 10px; }
+.wireguard-config-body label { margin-bottom: 6px; font-size: 13px; }
+.wireguard-config-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.wireguard-config-actions .button { min-height: 40px; width: auto; padding: 8px 10px; font-size: 13px; }
+.wireguard-import-button { cursor: pointer; }
+.wireguard-file-input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.wireguard-file-input:focus-visible + .wireguard-config-save { outline: 2px solid var(--green); }
+.wireguard-config-editor { display: block; width: 100%; min-height: 150px; max-height: 240px; resize: vertical; padding: 10px; border: 1px solid var(--input-border); border-radius: 6px; color: var(--ink); background: var(--surface-subtle); font: 12px/1.45 Consolas, "Courier New", monospace; }
+.wireguard-config-editor:focus { outline: 2px solid var(--green); outline-offset: 2px; }
+.wireguard-config-hint { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.wireguard-config .form-message { margin-top: 6px; min-height: 20px; font-size: 13px; }
 .opensanctions-settings { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
 .opensanctions-settings h3 { margin: 0; font-size: 18px; font-weight: 600; }
 .opensanctions-status, .opensanctions-details, .opensanctions-message { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
@@ -258,6 +271,8 @@ button:focus-visible, a:focus-visible, summary:focus-visible { outline: 2px soli
   .settings-actions .button { grid-column: 1 / -1; }
   .settings-actions .delete-key { grid-column: 2; }
   .wireguard-actions { grid-template-columns: minmax(0, 1fr); }
+  .wireguard-config-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .wireguard-config-actions .button { width: 100%; }
   .search-section { padding-top: 24px; }
   h1 { font-size: 24px; }
   .search-controls { grid-template-columns: minmax(0, 1fr); }
